@@ -25,6 +25,12 @@ TEST_DESCRIPTIONS: dict[str, str] = {
     "extra_region_restriction": "Проверяет доступ к стриминг-сервисам (Netflix, Disney+, Spotify и др.) по регионам.",
     "extra_rbl_check": "Проверяет IP по ~190 спам-базам (RBL/DNSBL) — важно для почтовых серверов.",
     "extra_netquality": "Анализирует качество BGP-маршрутов, пиринга и сетевых соседей провайдера.",
+    "extra_udp_throttle": "Проверяет, режет ли провайдер UDP-трафик — критично для WireGuard/Hysteria2/QUIC.",
+    "extra_sustained_load": "Длинный тест скорости (90 сек) — ловит throttling/оверселл, которые быстрые бенчмарки не замечают.",
+    "extra_ipv6": "Проверяет наличие и работоспособность IPv6-подключения.",
+    "extra_bufferbloat": "Измеряет рост пинга под насыщающей нагрузкой — важно для звонков и игр через VPN.",
+    "extra_dns_hijack": "Сравнивает ответы DNS через системный резолвер, напрямую и через DoH — ловит перехват DNS.",
+    "extra_cdn_ttfb": "Измеряет время до первого байта от крупных CDN (Cloudflare, Google, Netflix, YouTube).",
 }
 
 

@@ -50,6 +50,10 @@ class TestDef:
 #   on that run (heavy first-run installs: nexttrace, speedtest-cli, iperf3, mtr, ...) but that's
 #   worst-case-ish, so it's set well below the raw measurement rather than matching it exactly.
 #   One real sample per test — revisit if pacing keeps diverging once there's more than one.
+#   The 6 "extra_*" tests added 2026-08-30 for the VPN-node-reseller audience (UDP throttling,
+#   sustained load, IPv6, bufferbloat, DNS hijack, CDN peering) are calibrated the same way, from
+#   a real end-to-end run of just that subset against a disposable test VPS via the bot's actual
+#   MultitestRun pipeline (not a standalone shell test) — see the same session's notes.
 TEST_CATALOG: list[TestDef] = [
     TestDef("run_ip_region", "IP Region", 180, "vendor", "run_ip_region"),
     TestDef("run_censorcheck_geoblock", "Censorcheck Geo", 210, "vendor", "run_censorcheck_geoblock"),
@@ -104,6 +108,166 @@ TEST_CATALOG: list[TestDef] = [
         "bash <(curl -Ls https://raw.githubusercontent.com/xykt/NetQuality/main/net.sh) -E -y -S 67",
         dep="curl",
     ),
+    # --- Added for the VPN-node-reseller audience: none of the above tests cover UDP/QUIC
+    # behavior, sustained (post-warmup) throughput, IPv6, bufferbloat, or DNS integrity — all
+    # live-verified against a real VPS before shipping (see session notes). Both iperf3-based
+    # tests below deliberately use different primary public servers (iperf.he.net vs
+    # ping.online.net) so selecting both in one run doesn't collide on the same server's
+    # single-client-at-a-time slot; each still falls back to the other + retries once, since
+    # "server busy" from a public iperf3 node is normal contention, not a VPS-side problem.
+    TestDef(
+        "extra_udp_throttle", "UDP Throttling (WireGuard/QUIC)", 45, "shell",
+        """echo "Тест UDP-throttling (эмуляция WireGuard/Hysteria2/QUIC трафика, 50 Мбит/с, 20 сек)"
+for s in iperf.he.net ping.online.net; do
+  for attempt in 1 2; do
+    echo "Пробую сервер: $s (попытка $attempt)"
+    OUT=$(timeout 25 iperf3 -c "$s" -u -b 50M -t 20 -f m 2>&1)
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+      echo "$OUT" | grep -E "sender|receiver"
+      echo "ИТОГ: сервер $s. Receiver-строка = реально дошедший трафик (bitrate/jitter/loss). Большой Lost % или сильно заниженный bitrate против заявленных 50M = провайдер режет UDP."
+      exit 0
+    fi
+    echo "$OUT" | tail -1
+    sleep 5
+  done
+done
+echo "ИТОГ: публичные iperf3-серверы сейчас заняты/недоступны — тест временно недоступен, попробуйте повторить проверку позже."
+""",
+        dep="iperf3",
+    ),
+    TestDef(
+        "extra_sustained_load", "Sustained Load (throttling/оверселл)", 110, "shell",
+        # 90s/15s-interval TCP run — cheap oversold VPS often throttle well after YABS/bench.sh's
+        # quick burst-style measurements finish. Result deliberately flags that a late-run drop
+        # can also be the public test server's own fair-use cap (verified live: iperf.he.net
+        # stayed flat across a 90s run while ping.online.net cliffed hard after ~45s) — not
+        # attributed to the VPS without that caveat.
+        """echo "Тест устойчивости скорости (90 сек TCP, ловим throttling после прогрева канала)"
+for s in ping.online.net iperf.he.net; do
+  for attempt in 1 2; do
+    echo "Пробую сервер: $s (попытка $attempt)"
+    OUT=$(timeout 100 iperf3 -c "$s" -t 90 -i 15 -f m 2>&1)
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+      echo "$OUT" | grep -E "^\\[  5\\]" | grep -v "ID\\]"
+      FIRST=$(echo "$OUT" | grep -E "^\\[  5\\]   0.00-15" | grep -oE "[0-9.]+ Mbits/sec" | head -1)
+      LAST=$(echo "$OUT" | grep -E "^\\[  5\\]  75.00-90" | grep -oE "[0-9.]+ Mbits/sec" | head -1)
+      echo "ИТОГ: сервер $s. Первые 15 сек: ${FIRST:-н/д}, последние 15 сек: ${LAST:-н/д}. Резкое падение может быть как throttling/оверселлом канала сервера, так и собственным fair-use лимитом публичного iperf3-узла — для надёжного вывода сравните с другим прогоном/сервером."
+      exit 0
+    fi
+    echo "$OUT" | tail -1
+    sleep 5
+  done
+done
+echo "ИТОГ: публичные iperf3-серверы сейчас заняты/недоступны — тест временно недоступен, попробуйте повторить проверку позже."
+""",
+        dep="iperf3",
+    ),
+    TestDef(
+        "extra_ipv6", "IPv6 Connectivity", 20, "shell",
+        """IP6=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | head -1)
+if [ -z "$IP6" ]; then
+  echo "IPv6 не настроен на этом сервере (только IPv4)."
+  echo "ИТОГ: IPv6 отсутствует — клиенты, которым нужен IPv6-выход, здесь его не получат."
+else
+  echo "IPv6-адрес: $IP6"
+  echo "Пинг до 1.1.1.1 (Cloudflare) по IPv6:"
+  ping -6 -c 3 -W 2 2606:4700:4700::1111 2>&1 | tail -3
+  echo "Пинг до 8.8.8.8 (Google) по IPv6:"
+  ping -6 -c 3 -W 2 2001:4860:4860::8888 2>&1 | tail -3
+  echo "HTTP через IPv6:"
+  curl -6 -s --max-time 6 -o /dev/null -w "ipv6.google.com: http=%{http_code} time=%{time_total}s\\n" https://ipv6.google.com/ 2>&1
+  echo "ИТОГ: IPv6 настроен; если пинги и HTTP-запрос выше прошли успешно (0% packet loss, http=200) — IPv6-выход рабочий."
+fi
+""",
+        dep="curl",
+    ),
+    TestDef(
+        "extra_bufferbloat", "Bufferbloat (латентность под нагрузкой)", 45, "shell",
+        # Baseline ping, then saturate both directions via Cloudflare's speed-test endpoints
+        # while re-pinging — a fast server can still ruin calls/games if buffers bloat under load.
+        """echo "Тест Bufferbloat (рост пинга/джиттера под насыщающей нагрузкой — важно для звонков/игр через VPN)"
+echo "--- Пинг в покое (10 пакетов до 1.1.1.1) ---"
+IDLE=$(ping -c 10 -i 0.2 -W 2 1.1.1.1 2>&1)
+echo "$IDLE" | tail -2
+
+curl -s -o /dev/null --max-time 25 "https://speed.cloudflare.com/__down?bytes=500000000" &
+DLPID=$!
+( dd if=/dev/zero bs=1M count=300 2>/dev/null | curl -s -o /dev/null --max-time 25 -T - "https://speed.cloudflare.com/__up" ) &
+ULPID=$!
+sleep 3
+
+echo "--- Пинг под насыщающей нагрузкой (одновременно download+upload) ---"
+LOAD=$(ping -c 10 -i 0.2 -W 2 1.1.1.1 2>&1)
+echo "$LOAD" | tail -2
+
+wait $DLPID 2>/dev/null
+wait $ULPID 2>/dev/null
+
+IDLE_AVG=$(echo "$IDLE" | grep -oE '= [0-9.]+/[0-9.]+/[0-9.]+/[0-9.]+' | awk -F/ '{print $2}')
+LOAD_AVG=$(echo "$LOAD" | grep -oE '= [0-9.]+/[0-9.]+/[0-9.]+/[0-9.]+' | awk -F/ '{print $2}')
+echo "ИТОГ: пинг в покое ~${IDLE_AVG:-н/д} мс, под нагрузкой ~${LOAD_AVG:-н/д} мс. Рост в разы = заметный bufferbloat (буферы канала переполняются, звонки/игры будут лагать под нагрузкой)."
+""",
+        dep="curl",
+    ),
+    TestDef(
+        "extra_dns_hijack", "DNS Hijack/Leak Check", 25, "shell",
+        # Resolves a domain with a fixed, well-known answer (one.one.one.one -> 1.1.1.1/1.0.0.1)
+        # via three independent paths — system stub resolver, explicit plain UDP:53 to 1.1.1.1,
+        # and encrypted DoH — and flags any disagreement as likely network-level interception.
+        """command -v dig >/dev/null 2>&1 || (apt-get install -y dnsutils || dnf install -y bind-utils || \\
+  yum install -y bind-utils || apk add --quiet bind-tools || pacman -S --noconfirm bind) >/dev/null 2>&1
+
+echo "Тест перехвата DNS (сравнение системного резолвера, публичного DNS напрямую и DoH)"
+
+get_ips() {
+  echo "$1" | grep -oE '[0-9]{1,3}(\\.[0-9]{1,3}){3}' | sort -u | tr '\\n' ',' | sed 's/,$//'
+}
+
+DOMAIN=one.one.one.one
+
+SYS=$(dig +short +time=3 +tries=1 "$DOMAIN" A 2>/dev/null)
+SYS_IPS=$(get_ips "$SYS")
+echo "Системный резолвер: ${SYS_IPS:-нет ответа}"
+
+DIRECT=$(dig +short +time=3 +tries=1 @1.1.1.1 "$DOMAIN" A 2>/dev/null)
+DIRECT_IPS=$(get_ips "$DIRECT")
+echo "Напрямую к 1.1.1.1 (UDP:53): ${DIRECT_IPS:-нет ответа}"
+
+DOH=$(curl -s --max-time 6 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=${DOMAIN}&type=A" 2>/dev/null)
+DOH_IPS=$(get_ips "$DOH")
+echo "DoH (HTTPS, шифрованный): ${DOH_IPS:-нет ответа}"
+
+if [ -z "$SYS_IPS" ] && [ -z "$DIRECT_IPS" ] && [ -z "$DOH_IPS" ]; then
+  echo "ИТОГ: ни один метод не получил ответ — DNS/сеть недоступны для проверки."
+elif [ "$SYS_IPS" = "$DIRECT_IPS" ] && [ "$DIRECT_IPS" = "$DOH_IPS" ]; then
+  echo "ИТОГ: все три метода сошлись — признаков перехвата/подмены DNS не обнаружено."
+else
+  echo "ИТОГ: ⚠️ ответы РАЗЛИЧАЮТСЯ между методами — возможен перехват/подмена DNS на уровне сети/провайдера."
+fi
+""",
+        dep="curl",
+    ),
+    TestDef(
+        "extra_cdn_ttfb", "CDN Peering (TTFB)", 25, "shell",
+        "echo \"Тест TTFB до крупных CDN/edge-сетей (насколько хорошо датацентр запирован с большими сетями)\"\n"
+        "for pair in \"Cloudflare:https://www.cloudflare.com/\" \"Google:https://www.google.com/\" "
+        "\"Netflix:https://www.netflix.com/\" \"YouTube:https://www.youtube.com/\"; do\n"
+        "  name=\"${pair%%:*}\"\n"
+        "  url=\"${pair#*:}\"\n"
+        "  RES=$(curl -s -o /dev/null --max-time 8 -w \"connect=%{time_connect}s ttfb=%{time_starttransfer}s "
+        "total=%{time_total}s http=%{http_code}\" \"$url\" 2>/dev/null)\n"
+        "  if [ -z \"$RES\" ]; then\n"
+        "    echo \"$name: недоступен (таймаут/ошибка)\"\n"
+        "  else\n"
+        "    echo \"$name: $RES\"\n"
+        "  fi\n"
+        "done\n"
+        "echo \"ИТОГ: ttfb ниже ~0.15-0.3с для основных CDN — хороший пиринг датацентра; заметно выше или "
+        "таймауты — CDN плохо доступны с этого хоста.\"\n",
+        dep="curl",
+    ),
 ]
 
 # Single source of truth for grouping tests by topic — used both by the test-picker keyboard
@@ -111,16 +275,18 @@ TEST_CATALOG: list[TestDef] = [
 CATEGORIES: list[tuple[str, str, list[str]]] = [
     ("performance", "⚡ Производительность", [
         "run_yabs", "run_sysbench_cpu", "run_bench_sh", "extra_bench_gig", "extra_speed_tlab",
+        "extra_sustained_load",
     ]),
     ("network", "🌍 Сеть", [
         "run_ip_region", "extra_ipregion_xyz", "run_iperf3_ru", "run_iperf3_tlab", "extra_netquality",
+        "extra_udp_throttle", "extra_ipv6", "extra_bufferbloat", "extra_cdn_ttfb",
     ]),
     ("ip_quality", "🔐 IP Quality", [
         "run_ip_quality", "run_ip_check_place", "extra_region_restriction", "extra_rbl_check",
     ]),
     ("censorship", "🛡 Censorship / DPI", [
         "run_censorcheck_geoblock", "run_censorcheck_dpi", "run_censorcheck_tlab",
-        "extra_dpi_detector", "extra_instagram_audio",
+        "extra_dpi_detector", "extra_instagram_audio", "extra_dns_hijack",
     ]),
 ]
 
