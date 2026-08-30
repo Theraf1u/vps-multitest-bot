@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Server Multitest Report</title>
+<style>
+  @page {
+    size: A4;
+    margin: 16mm 14mm;
+    @bottom-center {
+      content: "Multitest report · " counter(page) " / " counter(pages);
+      font-size: 8pt;
+      color: #9aa3af;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "DejaVu Sans", "Segoe UI", Arial, sans-serif;
+    color: #1a1f29;
+    font-size: 10.5pt;
+    line-height: 1.4;
+  }
+  h1, h2, h3 { margin: 0 0 8px 0; font-weight: 700; }
+  .cover {
+    text-align: center;
+    padding-top: 40mm;
+  }
+  .cover .eyebrow {
+    letter-spacing: 3px;
+    font-size: 10pt;
+    color: #6b7280;
+    margin-bottom: 6px;
+  }
+  .cover h1 {
+    font-size: 26pt;
+    margin-bottom: 4px;
+  }
+  .cover .server {
+    font-size: 14pt;
+    color: #374151;
+    margin-top: 6px;
+  }
+  .cover .date {
+    margin-top: 40px;
+    color: #9aa3af;
+    font-size: 9pt;
+  }
+  .page-break { page-break-before: always; }
+
+  .server-info {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 14px 0 20px 0;
+  }
+  .info-card {
+    background: #f3f4f6;
+    border-radius: 8px;
+    padding: 8px 12px;
+    width: 30%;
+  }
+  .info-card .k { font-size: 8pt; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+  .info-card .v { font-size: 11pt; font-weight: 700; margin-top: 2px; word-break: break-word; }
+
+  .section-title {
+    font-size: 14pt;
+    border-bottom: 2px solid #111827;
+    padding-bottom: 4px;
+    margin: 22px 0 12px 0;
+  }
+
+  .card-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .stat-card {
+    background: #111827;
+    color: #fff;
+    border-radius: 10px;
+    padding: 10px 14px;
+    min-width: 28%;
+  }
+  .stat-card .label { font-size: 8pt; opacity: 0.75; }
+  .stat-card .value { font-size: 13pt; font-weight: 700; margin-top: 2px; }
+
+  .test-block { margin-bottom: 14px; }
+  .test-block h3 {
+    font-size: 11.5pt;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .badge { font-size: 8pt; padding: 1px 7px; border-radius: 999px; font-weight: 700; }
+  .badge-ok { background: #dcfce7; color: #166534; }
+  .badge-err { background: #fee2e2; color: #991b1b; }
+  .badge-skip { background: #e5e7eb; color: #4b5563; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 9.5pt; margin-top: 4px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #e5e7eb; }
+  th { color: #6b7280; font-weight: 600; font-size: 8pt; text-transform: uppercase; }
+
+  .status-ok { color: #166534; }
+  .status-bad { color: #991b1b; }
+  .status-warn { color: #92400e; }
+  .status-na { color: #9ca3af; }
+
+  .ai-box {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 14px 16px;
+    white-space: pre-wrap;
+    font-size: 10.5pt;
+  }
+  .ai-missing { color: #9ca3af; font-style: italic; }
+
+  .raw pre {
+    background: #0b1020;
+    color: #d1d5db;
+    font-size: 8pt;
+    padding: 8px 10px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 4px 0 12px 0;
+  }
+</style>
+</head>
+<body>
+
+  <div class="cover">
+    <div class="eyebrow">SERVER MULTITEST REPORT</div>
+    <h1>{{ server_label }}</h1>
+    <div class="server">{{ facts.hostname }} · {{ facts.os_name }}</div>
+    <div class="date">Сформировано {{ generated_at }} · пройдено {{ ok_count }}/{{ total_count }} тестов</div>
+  </div>
+
+  <div class="page-break"></div>
+
+  <div class="section-title">Server</div>
+  <div class="server-info">
+    <div class="info-card"><div class="k">Hostname</div><div class="v">{{ facts.hostname }}</div></div>
+    <div class="info-card"><div class="k">OS</div><div class="v">{{ facts.os_name }}</div></div>
+    <div class="info-card"><div class="k">Architecture</div><div class="v">{{ facts.arch }}</div></div>
+    <div class="info-card"><div class="k">CPU</div><div class="v">{{ facts.cpu_model }}</div></div>
+    <div class="info-card"><div class="k">CPU cores</div><div class="v">{{ facts.cpu_cores }}</div></div>
+    <div class="info-card"><div class="k">RAM</div><div class="v">{{ facts.ram_mb }} MB</div></div>
+    <div class="info-card"><div class="k">Disk</div><div class="v">{{ facts.disk_total }}</div></div>
+    <div class="info-card"><div class="k">Дата проверки</div><div class="v">{{ generated_at }}</div></div>
+  </div>
+
+  {% for group in groups %}
+    {% if group.tests %}
+    <div class="section-title">{{ group.title }}</div>
+    {% for item in group.tests %}
+      <div class="test-block">
+        <h3>
+          {{ item.label }}
+          {% if not item.ran %}<span class="badge badge-skip">не выполнен</span>
+          {% elif item.ok %}<span class="badge badge-ok">OK</span>
+          {% else %}<span class="badge badge-err">ошибка</span>{% endif %}
+        </h3>
+        {% if item.ran and item.ok %}
+          {% if item.primary_metrics %}
+          <div class="card-row">
+            {% for name, value, kind in item.primary_metrics %}
+            <div class="stat-card"><div class="label">{{ name }}</div><div class="value">{{ value }}</div></div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if item.metrics %}
+          <table>
+            <tr><th>Показатель</th><th>Значение</th></tr>
+            {% for name, value, kind in item.metrics %}
+            <tr><td>{{ name }}</td><td>{{ value }}</td></tr>
+            {% endfor %}
+          </table>
+          {% endif %}
+          {% if item.services %}
+          <table>
+            <tr><th>Сервис</th><th>Статус</th><th>Значение</th></tr>
+            {% for _type, name, status, value in item.services %}
+            <tr>
+              <td>{{ name }}</td>
+              <td class="status-{{ 'ok' if status == 'ok' else ('bad' if status == 'bad' else ('warn' if status == 'warn' else 'na')) }}">{{ status or '—' }}</td>
+              <td>{{ value }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+          {% endif %}
+        {% endif %}
+      </div>
+    {% endfor %}
+    {% endif %}
+  {% endfor %}
+
+  <div class="page-break"></div>
+  <div class="section-title">🤖 AI-анализ</div>
+  {% if ai_text %}
+    <div class="ai-box">{{ ai_text }}</div>
+  {% else %}
+    <div class="ai-missing">AI-анализ недоступен (OpenRouter выключен или не ответил).</div>
+  {% endif %}
+
+  <div class="section-title">📋 Детальные результаты</div>
+  {% for item in detailed %}
+    <div class="test-block">
+      <h3>
+        {{ item.label }}
+        {% if not item.ran %}<span class="badge badge-skip">не выполнен</span>
+        {% elif item.ok %}<span class="badge badge-ok">OK</span>
+        {% else %}<span class="badge badge-err">ошибка</span>{% endif %}
+      </h3>
+      {% if item.ran %}
+        {% if item.primary_metrics or item.metrics %}
+        <table>
+          <tr><th>Показатель</th><th>Значение</th></tr>
+          {% for name, value, kind in item.primary_metrics %}
+          <tr><td><strong>{{ name }}</strong></td><td><strong>{{ value }}</strong></td></tr>
+          {% endfor %}
+          {% for name, value, kind in item.metrics %}
+          <tr><td>{{ name }}</td><td>{{ value }}</td></tr>
+          {% endfor %}
+        </table>
+        {% endif %}
+      {% endif %}
+    </div>
+  {% endfor %}
+
+  {% if raw_section %}
+  <div class="page-break"></div>
+  <div class="section-title">Raw data / Technical details</div>
+  <div class="raw">
+    {% for r in raw_section %}
+      <h3>{{ r.label }} {% if not r.ok %}<span class="badge badge-err">ошибка</span>{% endif %}</h3>
+      <pre>{{ r.excerpt }}</pre>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+</body>
+</html>

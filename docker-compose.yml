@@ -1,0 +1,10 @@
+services:
+  vps-test-bot:
+    build: .
+    container_name: vps-test-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./vendor:/app/vendor

@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# runtime data (db, generated PDFs, permanent report archive)
+data/
+
+# offline-build vendored dependencies (see README "Офлайн-сборка образа")
+wheels/
+debs/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

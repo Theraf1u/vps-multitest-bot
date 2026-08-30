@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import datetime as dt
+
+from sqlalchemy import delete, func, select, update
+
+from bot.database.db import async_session
+from bot.database.models import KnownFingerprint, OpenRouterUsage, RateLimit, Setting, TestRun, User, utcnow
+
+
+async def upsert_user(user_id: int, username: str | None) -> bool:
+    """Returns True if this is the user's first-ever /start (a fresh registration)."""
+    async with async_session() as s:
+        obj = await s.get(User, user_id)
+        is_new = obj is None
+        if obj is None:
+            s.add(User(id=user_id, username=username))
+        else:
+            obj.username = username
+            obj.last_seen = utcnow()
+        await s.commit()
+        return is_new
+
+
+async def get_setting(key: str, default: str | None = None) -> str | None:
+    async with async_session() as s:
+        obj = await s.get(Setting, key)
+        return obj.value if obj else default
+
+
+async def set_setting(key: str, value: str | None) -> None:
+    async with async_session() as s:
+        obj = await s.get(Setting, key)
+        if obj is None:
+            s.add(Setting(key=key, value=value))
+        else:
+            obj.value = value
+        await s.commit()
+
+
+async def try_acquire_slot(user_id: int, max_per_user: int, max_global: int) -> bool:
+    """Atomically checks per-user and global concurrency limits; registers the slot if free."""
+    async with async_session() as s:
+        mine = await s.scalar(select(func.count()).select_from(RateLimit).where(RateLimit.user_id == user_id))
+        if mine and mine >= max_per_user:
+            return False
+        total = await s.scalar(select(func.count()).select_from(RateLimit))
+        if total and total >= max_global:
+            return False
+        s.add(RateLimit(user_id=user_id))
+        await s.commit()
+        return True
+
+
+async def release_slot(user_id: int) -> None:
+    async with async_session() as s:
+        await s.execute(delete(RateLimit).where(RateLimit.user_id == user_id))
+        await s.commit()
+
+
+async def active_tests_count() -> int:
+    async with async_session() as s:
+        return int(await s.scalar(select(func.count()).select_from(RateLimit)) or 0)
+
+
+async def count_runs_today(user_id: int) -> int:
+    """Successful reports this user has produced since 00:00 UTC today — backs the
+    admin-configurable daily per-user report limit (Setting "daily_report_limit")."""
+    start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    async with async_session() as s:
+        result = await s.execute(
+            select(func.count()).select_from(TestRun).where(
+                TestRun.user_id == user_id,
+                TestRun.status == "success",
+                TestRun.started_at >= start,
+            )
+        )
+        return result.scalar_one()
+
+
+async def create_test_run(user_id: int, host: str, port: int) -> int:
+    async with async_session() as s:
+        run = TestRun(user_id=user_id, host=host, port=port)
+        s.add(run)
+        await s.commit()
+        return run.id
+
+
+async def finish_test_run(run_id: int, status: str, tests_ok: int, tests_failed: int, error: str | None = None) -> None:
+    async with async_session() as s:
+        await s.execute(
+            update(TestRun)
+            .where(TestRun.id == run_id)
+            .values(
+                status=status,
+                tests_ok=tests_ok,
+                tests_failed=tests_failed,
+                error=error,
+                finished_at=utcnow(),
+            )
+        )
+        await s.commit()
+
+
+async def get_known_fingerprint(user_id: int, host: str, port: int) -> str | None:
+    async with async_session() as s:
+        obj = await s.scalar(
+            select(KnownFingerprint).where(
+                KnownFingerprint.user_id == user_id,
+                KnownFingerprint.host == host,
+                KnownFingerprint.port == port,
+            )
+        )
+        return obj.fingerprint if obj else None
+
+
+async def remember_fingerprint(user_id: int, host: str, port: int, fingerprint: str) -> None:
+    async with async_session() as s:
+        obj = await s.scalar(
+            select(KnownFingerprint).where(
+                KnownFingerprint.user_id == user_id,
+                KnownFingerprint.host == host,
+                KnownFingerprint.port == port,
+            )
+        )
+        if obj is None:
+            s.add(KnownFingerprint(user_id=user_id, host=host, port=port, fingerprint=fingerprint))
+        else:
+            obj.fingerprint = fingerprint
+            obj.updated_at = utcnow()
+        await s.commit()
+
+
+async def list_recent_users(limit: int = 10) -> list[User]:
+    async with async_session() as s:
+        rows = await s.scalars(select(User).order_by(User.last_seen.desc()).limit(limit))
+        return list(rows)
+
+
+async def list_users_page(offset: int = 0, limit: int = 10) -> list[User]:
+    async with async_session() as s:
+        rows = await s.scalars(
+            select(User).order_by(User.last_seen.desc()).offset(offset).limit(limit)
+        )
+        return list(rows)
+
+
+async def count_users() -> int:
+    async with async_session() as s:
+        return int(await s.scalar(select(func.count()).select_from(User)) or 0)
+
+
+async def get_user(user_id: int) -> User | None:
+    async with async_session() as s:
+        return await s.get(User, user_id)
+
+
+async def list_user_runs(user_id: int, limit: int = 10) -> list[TestRun]:
+    async with async_session() as s:
+        rows = await s.scalars(
+            select(TestRun)
+            .where(TestRun.user_id == user_id)
+            .order_by(TestRun.started_at.desc())
+            .limit(limit)
+        )
+        return list(rows)
+
+
+async def get_test_run(run_id: int) -> TestRun | None:
+    async with async_session() as s:
+        return await s.get(TestRun, run_id)
+
+
+async def delete_user(user_id: int) -> None:
+    """Wipes every DB row tied to this user (test runs, fingerprints, rate-limit slot,
+    OpenRouter usage). Does not touch the filesystem archive — see archive.delete_user_dir."""
+    async with async_session() as s:
+        for model in (TestRun, KnownFingerprint, RateLimit, OpenRouterUsage):
+            await s.execute(delete(model).where(model.user_id == user_id))
+        await s.execute(delete(User).where(User.id == user_id))
+        await s.commit()
+
+
+async def count_ai_analyses(run_id: int) -> int:
+    """Successful OpenRouter analyses already spent on this test run — used to cap the AI
+    button at 2 uses per run (one right after the test, one from history)."""
+    async with async_session() as s:
+        result = await s.execute(
+            select(func.count()).select_from(OpenRouterUsage).where(
+                OpenRouterUsage.run_id == run_id, OpenRouterUsage.ok.is_(True)
+            )
+        )
+        return result.scalar_one()
+
+
+async def record_openrouter_usage(
+    user_id: int, run_id: int | None, model: str, cost_usd: float, tokens_in: int, tokens_out: int, ok: bool
+) -> None:
+    async with async_session() as s:
+        s.add(
+            OpenRouterUsage(
+                user_id=user_id,
+                run_id=run_id,
+                model=model,
+                cost_usd=cost_usd,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                ok=ok,
+            )
+        )
+        await s.commit()
+
+
+async def openrouter_spend_summary() -> dict:
+    async with async_session() as s:
+        total_cost = await s.scalar(select(func.sum(OpenRouterUsage.cost_usd)))
+        total_calls = await s.scalar(select(func.count()).select_from(OpenRouterUsage))
+        today_start = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_cost = await s.scalar(
+            select(func.sum(OpenRouterUsage.cost_usd)).where(OpenRouterUsage.created_at >= today_start)
+        )
+        today_calls = await s.scalar(
+            select(func.count()).select_from(OpenRouterUsage).where(OpenRouterUsage.created_at >= today_start)
+        )
+        failed_calls = await s.scalar(
+            select(func.count()).select_from(OpenRouterUsage).where(OpenRouterUsage.ok.is_(False))
+        )
+        return {
+            "total_cost": total_cost or 0.0,
+            "total_calls": total_calls or 0,
+            "today_cost": today_cost or 0.0,
+            "today_calls": today_calls or 0,
+            "failed_calls": failed_calls or 0,
+        }
+
+
+async def stats_summary() -> dict:
+    async with async_session() as s:
+        total_users = await s.scalar(select(func.count()).select_from(User))
+        total_tests = await s.scalar(select(func.count()).select_from(TestRun))
+        today_start = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        tests_today = await s.scalar(
+            select(func.count()).select_from(TestRun).where(TestRun.started_at >= today_start)
+        )
+        success = await s.scalar(select(func.count()).select_from(TestRun).where(TestRun.status == "success"))
+        errors = await s.scalar(
+            select(func.count()).select_from(TestRun).where(TestRun.status.in_(("error", "cancelled")))
+        )
+        active = await s.scalar(select(func.count()).select_from(RateLimit))
+        return {
+            "total_users": total_users or 0,
+            "total_tests": total_tests or 0,
+            "tests_today": tests_today or 0,
+            "success": success or 0,
+            "errors": errors or 0,
+            "active": active or 0,
+        }
