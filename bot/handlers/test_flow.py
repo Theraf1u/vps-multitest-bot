@@ -130,6 +130,17 @@ async def _safe_edit(message: Message, text: str, **kwargs) -> None:
             log.warning("edit_text retry failed: %s", e2)
 
 
+async def _mirror_admin(entry: dict, bot, text: str) -> None:
+    """Keeps the admin "test_starts" topic showing the exact same live progress screen the
+    user sees, prefixed with who's running it — see entry["admin_msg_id"] set up in
+    _proceed_after_fingerprint."""
+    msg_id = entry.get("admin_msg_id")
+    if not msg_id:
+        return
+    header = entry.get("admin_header", "")
+    await notify.notify_edit(bot, entry["admin_chat_id"], msg_id, header + text)
+
+
 async def cancel_running(user_id: int) -> bool:
     """Used by the history "🛑 Остановить" button: signals the same cancel_event the live
     progress message's stop button would. Returns False if this user has nothing running."""
@@ -143,13 +154,19 @@ async def cancel_running(user_id: int) -> bool:
 async def cleanup_abandoned(user_id: int, bot=None) -> None:
     """Called from /start etc. to reclaim state/rate-limit slots (and queue position) left
     behind by a flow the user walked away from before a background test task was actually
-    launched. Never touches an in-flight run — that cleans up itself when it finishes or is
-    cancelled."""
+    launched, or from a connection-lost run the user never came back to retry. Never touches a
+    run that's actively polling — that cleans up itself when it finishes or is cancelled."""
     entry = _pending.get(user_id)
-    if entry and not entry.get("task"):
+    if entry and (not entry.get("task") or entry.get("awaiting_reconnect")):
         if user_id in _queue:
             _queue.remove(user_id)
+        mt_run = entry.get("mt_run")
+        run_id = entry.get("run_id")
         _cleanup_pending(user_id)
+        if mt_run is not None:
+            asyncio.create_task(mt_run.abandon())  # best-effort remote cleanup, don't block on it
+        if run_id is not None:
+            await crud.finish_test_run(run_id, "error", 0, 0, error="Соединение потеряно, пользователь не вернулся")
         if bot is not None:
             await _release_and_advance(user_id, bot)
         else:
@@ -599,30 +616,50 @@ async def _proceed_after_fingerprint(message: Message, state: FSMContext, user_i
 
     cancel_event = asyncio.Event()
     entry["cancel_event"] = cancel_event
+    finish_early_event = asyncio.Event()
+    entry["finish_early_event"] = finish_early_event
 
     await state.set_state(TestFlow.running)
     text = _progress_text(creds.host, subset, 0, None, None)
     await _safe_edit(message, text, reply_markup=kb.stop_test())
+    entry["mt_run"] = mt.MultitestRun(conn, subset, creds)
+
+    who = f"@{message.chat.username}" if message.chat.username else str(user_id)
+    entry["admin_header"] = f"👤 user {who} (id {user_id})\n\n"
+    admin_msg = await notify.notify_send(message.bot, "test_starts", entry["admin_header"] + text)
+    if admin_msg:
+        entry["admin_chat_id"] = admin_msg.chat.id
+        entry["admin_msg_id"] = admin_msg.message_id
 
     task = asyncio.create_task(_run_and_report(message, state, user_id))
     entry["task"] = task
 
 
 async def _fail(message: Message, state: FSMContext, user_id: int, text: str) -> None:
+    entry = _pending.get(user_id)
     _cleanup_pending(user_id)
     await _release_and_advance(user_id, message.bot)
     await state.clear()
     await _safe_edit(message, text)
+    if entry:
+        await _mirror_admin(entry, message.bot, text)
 
 
-async def _run_and_report(message: Message, state: FSMContext, user_id: int) -> None:
+async def _run_and_report(
+    message: Message, state: FSMContext, user_id: int, mt_run: mt.MultitestRun | None = None
+) -> None:
+    """`mt_run=None` starts a fresh run; passing an existing instance (from a previous
+    MultitestConnectionLost) resumes polling it instead — see manual_reconnect below. Either
+    way the remote test process itself is untouched: it survives our SSH connection dropping
+    via `setsid nohup`, so a resume never re-runs already-completed tests."""
     entry = _pending[user_id]
-    conn = entry["conn"]
     creds: sshsvc.Credentials = entry["creds"]
     facts = entry["facts"]
     run_id = entry["run_id"]
     cancel_event: asyncio.Event = entry["cancel_event"]
+    finish_early_event: asyncio.Event = entry["finish_early_event"]
     subset = mt.catalog_subset(entry.get("selected_funcs"))
+    run: mt.MultitestRun = mt_run if mt_run is not None else entry["mt_run"]
 
     last_edit = 0.0
 
@@ -633,14 +670,40 @@ async def _run_and_report(message: Message, state: FSMContext, user_id: int) -> 
             return
         last_edit = now
         total_elapsed = time.time() - entry["started_at"]
-        await _safe_edit(
-            message,
-            _progress_text(creds.host, subset, completed, running_idx, running_elapsed, total_elapsed),
-            reply_markup=kb.stop_test(),
-        )
+        progress_text = _progress_text(creds.host, subset, completed, running_idx, running_elapsed, total_elapsed)
+        await _safe_edit(message, progress_text, reply_markup=kb.stop_test())
+        await _mirror_admin(entry, message.bot, progress_text)
+
+    async def on_status(text: str) -> None:
+        await _safe_edit(message, text, reply_markup=None)
+        await _mirror_admin(entry, message.bot, text)
 
     try:
-        result = await mt.run_multitest(conn, subset, on_progress=on_progress, cancel_event=cancel_event)
+        if mt_run is None:
+            result = await run.run(
+                on_progress=on_progress, cancel_event=cancel_event, on_status=on_status,
+                finish_early_event=finish_early_event,
+            )
+        else:
+            result = await run.resume(
+                on_progress=on_progress, cancel_event=cancel_event, on_status=on_status,
+                finish_early_event=finish_early_event,
+            )
+    except mt.MultitestConnectionLost as e:
+        entry["mt_run"] = e.run
+        entry["awaiting_reconnect"] = True
+        who = f"@{message.chat.username}" if message.chat.username else str(user_id)
+        await notify.notify_text(
+            message.bot, "errors",
+            f"⚠️ Связь потеряна (авто-переподключение не помогло): user {who}, сервер {creds.host}:{creds.port}",
+        )
+        lost_text = (
+            "⚠️ Связь с сервером потеряна, автоматически переподключиться не удалось.\n"
+            "Тест не сброшен — уже пройденные проверки сохранены на сервере, можно продолжить позже."
+        )
+        await _safe_edit(message, lost_text, reply_markup=kb.reconnect_offer())
+        await _mirror_admin(entry, message.bot, lost_text)
+        return
     except Exception as e:
         log.exception("multitest run failed")
         err_text = security.redact(str(e))
@@ -657,7 +720,10 @@ async def _run_and_report(message: Message, state: FSMContext, user_id: int) -> 
         return
 
     server_label = f"{creds.host}:{creds.port}"
-    await _safe_edit(message, f"✅ Тесты завершены ({result.ok_count}/{len(subset)} успешно)\n📄 Формирую отчёт...")
+    done_note = "⏭ Отчёт по пройденным тестам\n" if result.partial else ""
+    forming_text = f"{done_note}✅ Тесты завершены ({result.ok_count}/{len(subset)} успешно)\n📄 Формирую отчёт..."
+    await _safe_edit(message, forming_text)
+    await _mirror_admin(entry, message.bot, forming_text)
 
     os.makedirs(settings.reports_dir, exist_ok=True)
     date_str = time.strftime("%Y-%m-%d")
@@ -674,7 +740,9 @@ async def _run_and_report(message: Message, state: FSMContext, user_id: int) -> 
     raw_text = archive.build_raw_text(server_label, facts, result)
     archive.save_report(user_id, run_id, creds.host, pdf_path if pdf_ok else None, raw_text, None)
 
-    await _safe_edit(message, f"✅ Тесты завершены ({result.ok_count}/{len(subset)} успешно)\n📤 Отправляю PDF...")
+    sending_text = f"✅ Тесты завершены ({result.ok_count}/{len(subset)} успешно)\n📤 Отправляю PDF..."
+    await _safe_edit(message, sending_text)
+    await _mirror_admin(entry, message.bot, sending_text)
 
     from aiogram import Bot
 
@@ -713,11 +781,51 @@ async def _run_and_report(message: Message, state: FSMContext, user_id: int) -> 
             reply_markup=kb.ai_offer(run_id),
         )
 
-    await _safe_edit(message, f"✅ Проверка завершена ({result.ok_count}/{len(subset)} успешно)", reply_markup=None)
+    final_text = f"✅ Проверка завершена ({result.ok_count}/{len(subset)} успешно)"
+    await _safe_edit(message, final_text, reply_markup=None)
+    await _mirror_admin(entry, bot, final_text)
 
     _cleanup_pending(user_id)
     await _release_and_advance(user_id, bot)
     await state.clear()
+
+
+@router.callback_query(F.data == "test:reconnect")
+async def manual_reconnect(cb: CallbackQuery, state: FSMContext) -> None:
+    user_id = cb.from_user.id
+    entry = _pending.get(user_id)
+    mt_run = entry.get("mt_run") if entry else None
+    if not entry or mt_run is None:
+        await cb.answer("Сессия истекла — начните заново.", show_alert=True)
+        return
+    entry.pop("awaiting_reconnect", None)
+    await cb.answer()
+    reconnect_text = "🔄 Пробую переподключиться..."
+    await _safe_edit(cb.message, reconnect_text, reply_markup=None)
+    await _mirror_admin(entry, cb.bot, reconnect_text)
+    task = asyncio.create_task(_run_and_report(cb.message, state, user_id, mt_run=mt_run))
+    entry["task"] = task
+
+
+@router.callback_query(F.data == "test:reconnect_cancel")
+async def reconnect_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    user_id = cb.from_user.id
+    entry = _pending.get(user_id)
+    mt_run = entry.get("mt_run") if entry else None
+    run_id = entry.get("run_id") if entry else None
+    _cleanup_pending(user_id)
+    if mt_run is not None:
+        asyncio.create_task(mt_run.abandon())  # best-effort remote cleanup, don't block the UI on it
+    if run_id is not None:
+        await crud.finish_test_run(run_id, "cancelled", 0, 0, error="Соединение потеряно, пользователь отменил")
+    await _release_and_advance(user_id, cb.bot)
+    await state.clear()
+    is_admin = user_id == settings.admin_id
+    cancel_text = "🛑 Тест отменён. Данные на сервере (по возможности) удалены."
+    await cb.message.edit_text(cancel_text, reply_markup=kb.main_menu(is_admin))
+    if entry:
+        await _mirror_admin(entry, cb.bot, cancel_text)
+    await cb.answer()
 
 
 # Keyed by TestRun.id — holds just enough to run the AI analysis later, on demand, after the
@@ -801,6 +909,35 @@ async def stop_test(cb: CallbackQuery, state: FSMContext) -> None:
     if entry and entry.get("cancel_event"):
         entry["cancel_event"].set()
         await cb.answer("Останавливаю тест...")
-        await _safe_edit(cb.message, "🛑 Останавливаю тест и удаляю временные файлы на сервере...")
+        stopping_text = "🛑 Останавливаю тест и удаляю временные файлы на сервере..."
+        await _safe_edit(cb.message, stopping_text)
+        await _mirror_admin(entry, cb.bot, stopping_text)
+    else:
+        await cb.answer()
+
+
+@router.callback_query(F.data == "test:skip", TestFlow.running)
+async def skip_test(cb: CallbackQuery, state: FSMContext) -> None:
+    entry = _pending.get(cb.from_user.id)
+    mt_run: mt.MultitestRun | None = entry.get("mt_run") if entry else None
+    if not mt_run:
+        await cb.answer()
+        return
+    skipped = await mt_run.skip_current()
+    if skipped:
+        await cb.answer("⏭ Пропускаю текущий тест...")
+    else:
+        await cb.answer("Сейчас нечего пропускать — тест уже завершается сам.", show_alert=True)
+
+
+@router.callback_query(F.data == "test:finish_early", TestFlow.running)
+async def finish_early(cb: CallbackQuery, state: FSMContext) -> None:
+    entry = _pending.get(cb.from_user.id)
+    if entry and entry.get("finish_early_event"):
+        entry["finish_early_event"].set()
+        await cb.answer("📊 Собираю отчёт по уже пройденным тестам...")
+        stopping_text = "📊 Останавливаю оставшиеся тесты и формирую отчёт по пройденным..."
+        await _safe_edit(cb.message, stopping_text, reply_markup=None)
+        await _mirror_admin(entry, cb.bot, stopping_text)
     else:
         await cb.answer()

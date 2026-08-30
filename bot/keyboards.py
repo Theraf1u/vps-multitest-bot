@@ -136,6 +136,15 @@ def confirm_fingerprint() -> InlineKeyboardMarkup:
     )
 
 
+def reconnect_offer() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Попробовать ещё раз", callback_data="test:reconnect", style="primary")],
+            [InlineKeyboardButton(text="🛑 Отменить", callback_data="test:reconnect_cancel", style="danger")],
+        ]
+    )
+
+
 def ai_offer(run_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(
@@ -147,10 +156,20 @@ def ai_offer(run_id: int) -> InlineKeyboardMarkup:
 
 def stop_test() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(
-            text=_icon_text("stop_test", "❌", "Остановить тест"), callback_data="test:stop", style="danger",
-            icon_custom_emoji_id=icons.get("stop_test"),
-        )]]
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=_icon_text("test_skip", "⏭", "Скипнуть тест"), callback_data="test:skip", style="primary",
+                icon_custom_emoji_id=icons.get("test_skip"),
+            )],
+            [InlineKeyboardButton(
+                text=_icon_text("test_finish_early", "📊", "Отчёт по готовым"), callback_data="test:finish_early",
+                style="success", icon_custom_emoji_id=icons.get("test_finish_early"),
+            )],
+            [InlineKeyboardButton(
+                text=_icon_text("stop_test", "❌", "Остановить тест"), callback_data="test:stop", style="danger",
+                icon_custom_emoji_id=icons.get("stop_test"),
+            )],
+        ]
     )
 
 

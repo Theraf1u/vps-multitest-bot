@@ -14,6 +14,8 @@ SLOTS: dict[str, str] = {
     "confirm_pick": "🎯 Выбрать тесты",
     "picker_go": "▶️ Начать",
     "stop_test": "❌ Остановить тест",
+    "test_skip": "⏭ Скипнуть тест",
+    "test_finish_early": "📊 Отчёт по готовым",
     "history_pdf": "📄 Прислать PDF",
     "history_ai": "🤖 Проанализировать",
     "history_retry": "🔄 Повторить",

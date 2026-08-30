@@ -4,7 +4,7 @@ import logging
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, Message
 
 from bot.database import crud
 
@@ -95,6 +95,28 @@ async def notify_text(bot: Bot, category: str, text: str) -> None:
         await bot.send_message(chat_id, text, message_thread_id=thread_id)
     except TelegramAPIError as e:
         log.warning("notify_text(%s) failed: %s", category, e)
+
+
+async def notify_send(bot: Bot, category: str, text: str, **kwargs) -> Message | None:
+    """Like notify_text but returns the sent Message so the caller can later edit it in place
+    (see notify_edit) — used to mirror a live-updating progress screen into the admin topic."""
+    target = await _target(category)
+    if not target:
+        return None
+    chat_id, thread_id = target
+    try:
+        return await bot.send_message(chat_id, text, message_thread_id=thread_id, **kwargs)
+    except TelegramAPIError as e:
+        log.warning("notify_send(%s) failed: %s", category, e)
+        return None
+
+
+async def notify_edit(bot: Bot, chat_id: int, message_id: int, text: str, **kwargs) -> None:
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, **kwargs)
+    except TelegramAPIError as e:
+        if "message is not modified" not in str(e):
+            log.debug("notify_edit failed: %s", e)
 
 
 async def notify_document(bot: Bot, category: str, file_path: str, filename: str, caption: str | None = None) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from weasyprint import HTML
@@ -13,6 +14,26 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templat
 
 RAW_LOG_MAX_LINES = 12
 RAW_LOG_MAX_CHARS = 1500
+
+# Progress spinners (`| Checking: X` -> `/ Checking: X` -> `- Checking: X` -> ...) redraw the
+# same line with a different leading glyph each frame — captured via `script`, each frame lands
+# as its own "line". Strip the glyph before comparing so spinner_dedupe() can collapse a whole
+# run of frames down to just the last one.
+_SPINNER_GLYPH_RE = re.compile(r"^[|/\\\-•●⠇⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+")
+
+
+def _spinner_key(line: str) -> str:
+    return _SPINNER_GLYPH_RE.sub("", line)
+
+
+def _dedupe_spinner_frames(lines: list[str]) -> list[str]:
+    deduped: list[str] = []
+    for line in lines:
+        if deduped and _spinner_key(deduped[-1]) == _spinner_key(line):
+            deduped[-1] = line  # keep the latest frame of this run
+        else:
+            deduped.append(line)
+    return deduped
 
 
 def _by_func(result: MultitestResult) -> dict[str, ParsedTest]:
@@ -35,10 +56,13 @@ def _test_view(t: ParsedTest | None, label: str) -> dict:
 
 
 def _raw_excerpt(t: ParsedTest) -> str:
-    lines = [l for l in t.raw_log.splitlines() if l.strip()]
-    excerpt = "\n".join(lines[:RAW_LOG_MAX_LINES])
+    raw_lines = [l for l in t.raw_log.splitlines() if l.strip()]
+    deduped = _dedupe_spinner_frames(raw_lines)
+    # The result/summary a test prints is at the END of its output, not the start — a head
+    # excerpt was showing nothing but early spinner/setup chatter. Tail instead.
+    excerpt = "\n".join(deduped[-RAW_LOG_MAX_LINES:])
     if len(excerpt) > RAW_LOG_MAX_CHARS:
-        excerpt = excerpt[:RAW_LOG_MAX_CHARS] + "…"
+        excerpt = "…" + excerpt[-RAW_LOG_MAX_CHARS:]
     return excerpt
 
 

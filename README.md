@@ -14,7 +14,18 @@ Telegram-бот, который подключается по SSH к серве�
 
 ## Быстрый старт
 
+Установка одной командой (клонирует репозиторий, спросит `BOT_TOKEN`/`ADMIN_ID`,
+сгенерирует `MASTER_ENCRYPTION_KEY` и поднимет контейнер через `docker compose`):
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Theraf1u/vps-multitest-bot/main/install.sh | bash
+```
+
+Либо вручную:
+
+```bash
+git clone https://github.com/Theraf1u/vps-multitest-bot.git
+cd vps-multitest-bot
 cp .env.example .env
 # заполнить BOT_TOKEN, ADMIN_ID, MASTER_ENCRYPTION_KEY (и опционально OPENROUTER_*)
 docker compose up -d --build
@@ -117,6 +128,17 @@ premium-эмодзи, бот сам достаёт `custom_emoji_id` из entity
   `/start` и инлайн-кнопки, чтобы один пользователь не мог флудить бота без всякой цены.
   Обработка флуд-контроля самого Telegram (`TelegramRetryAfter`) на прогресс-барах — с
   единичным retry вместо падения таски.
+
+## Обновление бота
+
+```bash
+bash update.sh          # проверить и, если есть новая версия, обновить + пересобрать
+bash update.sh --check  # только проверить, ничего не трогая
+```
+
+Делает `git fetch` + сравнение с `origin/main`; если есть новые коммиты — показывает их список,
+подтягивает (`git pull --ff-only`), пересобирает образ и пересоздаёт контейнер. Без аргументов
+и без новых коммитов ничего не делает и просто сообщает, что версия актуальна.
 
 ## Обновление pinned-скрипта
 

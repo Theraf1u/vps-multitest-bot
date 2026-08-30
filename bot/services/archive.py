@@ -15,6 +15,28 @@ def _safe(s: str) -> str:
     return _SAFE_RE.sub("_", s)[:80]
 
 
+# Progress spinners (`| Checking: X` -> `/ Checking: X` -> ...) redraw the same line with a
+# different leading glyph each frame — captured via `script`, each frame lands as its own
+# "line". Strip the glyph before comparing so a whole run of frames collapses to the last one.
+# Kept in sync with the identical helper in report.py (duplicated rather than imported, so this
+# module doesn't pull in report.py's weasyprint/jinja2 dependency just for this).
+_SPINNER_GLYPH_RE = re.compile(r"^[|/\\\-•●⠇⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+")
+
+
+def _spinner_key(line: str) -> str:
+    return _SPINNER_GLYPH_RE.sub("", line)
+
+
+def _dedupe_spinner_frames(lines: list[str]) -> list[str]:
+    deduped: list[str] = []
+    for line in lines:
+        if deduped and _spinner_key(deduped[-1]) == _spinner_key(line):
+            deduped[-1] = line
+        else:
+            deduped.append(line)
+    return deduped
+
+
 def report_filename(host: str, date_str: str) -> str:
     """User-facing PDF filename wherever a report is sent (right after a test, from the
     archive, from admin) — `<host>_<YYYY-MM-DD>.pdf`, sanitized for the filesystem."""
@@ -101,8 +123,9 @@ def build_raw_text(server_label: str, facts, result) -> str:
         for _type, name, status, value in t.services:
             lines.append(f"  [service] {name}: {status} {value}")
         if t.raw_log.strip():
-            lines.append("  --- raw log (first 40 lines) ---")
-            for line in t.raw_log.splitlines()[:40]:
+            lines.append("  --- raw log (last 40 lines) ---")
+            deduped = _dedupe_spinner_frames([l for l in t.raw_log.splitlines() if l.strip()])
+            for line in deduped[-40:]:
                 if line.strip():
                     lines.append(f"  {line}")
     return "\n".join(lines)
