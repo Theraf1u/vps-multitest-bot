@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 from sqlalchemy import delete, func, select, update
 
@@ -36,6 +37,78 @@ async def set_setting(key: str, value: str | None) -> None:
         else:
             obj.value = value
         await s.commit()
+
+
+DEFAULT_MAINTENANCE_MESSAGE = (
+    "🛠 Сейчас ведутся технические работы, совсем скоро всё заработает.\n"
+    "Мы пришлём сообщение, как только можно будет запустить проверку."
+)
+
+MAINTENANCE_MODE_KEY = "maintenance_mode"
+MAINTENANCE_MESSAGE_KEY = "maintenance_message"
+MAINTENANCE_WAITERS_KEY = "maintenance_waiters"
+
+
+async def is_maintenance_mode() -> bool:
+    return (await get_setting(MAINTENANCE_MODE_KEY, "0")) == "1"
+
+
+async def set_maintenance_mode(enabled: bool) -> None:
+    await set_setting(MAINTENANCE_MODE_KEY, "1" if enabled else "0")
+
+
+async def get_maintenance_message() -> str:
+    return await get_setting(MAINTENANCE_MESSAGE_KEY, DEFAULT_MAINTENANCE_MESSAGE) or DEFAULT_MAINTENANCE_MESSAGE
+
+
+async def set_maintenance_message(text: str) -> None:
+    await set_setting(MAINTENANCE_MESSAGE_KEY, text)
+
+
+async def add_maintenance_waiter(user_id: int) -> None:
+    """Remembers a user who tried to start a test while maintenance mode was on, so they can be
+    pinged once it's switched off. Stored in Settings (not memory) so it survives the very bot
+    restart maintenance mode exists to smooth over."""
+    raw = await get_setting(MAINTENANCE_WAITERS_KEY, "[]")
+    try:
+        waiters: list[int] = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        waiters = []
+    if user_id not in waiters:
+        waiters.append(user_id)
+        await set_setting(MAINTENANCE_WAITERS_KEY, json.dumps(waiters))
+
+
+async def pop_maintenance_waiters() -> list[int]:
+    """Returns and clears the list of users waiting on maintenance mode to end."""
+    raw = await get_setting(MAINTENANCE_WAITERS_KEY, "[]")
+    try:
+        waiters: list[int] = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        waiters = []
+    await set_setting(MAINTENANCE_WAITERS_KEY, "[]")
+    return waiters
+
+
+def _user_daily_limit_key(user_id: int) -> str:
+    return f"daily_limit_user_{user_id}"
+
+
+async def get_user_daily_limit(user_id: int) -> int | None:
+    """Per-user override of the daily report limit (Setting key per user id). None means no
+    override — caller should fall back to the global "daily_report_limit" default."""
+    raw = await get_setting(_user_daily_limit_key(user_id))
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def set_user_daily_limit(user_id: int, value: int | None) -> None:
+    """`value=None` clears the override (falls back to the global default again)."""
+    await set_setting(_user_daily_limit_key(user_id), None if value is None else str(value))
 
 
 async def try_acquire_slot(user_id: int, max_per_user: int, max_global: int) -> bool:

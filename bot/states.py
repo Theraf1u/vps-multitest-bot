@@ -32,3 +32,8 @@ class AdminIcons(StatesGroup):
 
 class AdminLimits(StatesGroup):
     waiting_daily_limit = State()
+    waiting_user_daily_limit = State()  # data["target_user_id"] tells which user is being edited
+
+
+class AdminMaintenance(StatesGroup):
+    waiting_message = State()

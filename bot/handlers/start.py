@@ -20,8 +20,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await cleanup_abandoned(message.from_user.id, message.bot)
     is_new = await crud.upsert_user(message.from_user.id, message.from_user.username)
     is_admin = message.from_user.id == settings.admin_id
+
+    intro = test_info.build_menu_intro_text()
+    if await crud.is_maintenance_mode():
+        intro = f"{await crud.get_maintenance_message()}\n\n{intro}"
+
     await message.answer(
-        test_info.build_menu_intro_text(),
+        intro,
         reply_markup=kb.main_menu(is_admin),
         parse_mode="Markdown",
     )

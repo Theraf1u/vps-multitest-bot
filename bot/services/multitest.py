@@ -364,6 +364,7 @@ class MultitestRun:
         self._launch_pid: int | None = None
         self._cancelled = False
         self._last_running_idx: int | None = None  # 0-based index of the test polling last saw as "running"
+        self.skipped_indices: set[int] = set()  # 0-based indices skipped via skip_current()
 
     async def _upload_scripts(self) -> None:
         async with self.conn.start_sftp_client() as sftp:
@@ -539,6 +540,7 @@ class MultitestRun:
             await self.conn.run(f"kill -TERM -{pid} 2>/dev/null", check=False)
             await asyncio.sleep(1)
             await self.conn.run(f"kill -KILL -{pid} 2>/dev/null", check=False)
+            self.skipped_indices.add(idx)
             return True
         except (OSError, asyncssh.Error):
             return False

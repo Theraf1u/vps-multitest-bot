@@ -46,8 +46,21 @@ SUB_BAR_WIDTH = 10
 DEFAULT_DAILY_LIMIT = 5
 
 
-async def _daily_limit() -> int:
+async def _daily_limit(user_id: int) -> int:
+    """0 means unlimited. The bot admin is never capped (they're the primary tester); everyone
+    else gets their per-user override (admin panel -> user card) if set, else the global
+    default."""
+    if user_id == settings.admin_id:
+        return 0
+    override = await crud.get_user_daily_limit(user_id)
+    if override is not None:
+        return override
     return int(await crud.get_setting("daily_report_limit", str(DEFAULT_DAILY_LIMIT)))
+
+
+def _max_per_user(user_id: int) -> int:
+    """The bot admin is never capped on concurrent tests either — see _daily_limit."""
+    return 10**9 if user_id == settings.admin_id else settings.max_tests_per_user
 
 
 async def confirm_start_text(user_id: int, host: str, port: int, login: str) -> str:
@@ -61,7 +74,7 @@ async def confirm_start_text(user_id: int, host: str, port: int, login: str) -> 
         "⚠️ Multitest может устанавливать недостающие зависимости (curl/wget/iperf3/sysbench/jq) "
         "и выполнять сторонние benchmark-компоненты на сервере.",
     ]
-    limit = await _daily_limit()
+    limit = await _daily_limit(user_id)
     if limit > 0:
         used = await crud.count_runs_today(user_id)
         lines.append(f"\n📅 Отчётов сегодня: {used}/{limit}")
@@ -80,6 +93,7 @@ def _progress_text(
     running_idx: int | None,
     running_elapsed: float | None,
     total_elapsed: float = 0.0,
+    skipped: set[int] | None = None,
 ) -> str:
     total = len(subset)
     filled = int(15 * completed / total) if total else 0
@@ -91,7 +105,10 @@ def _progress_text(
     for i, t in enumerate(subset):
         label, estimate = t.label, t.estimated_secs
         if i < completed:
-            lines.append(f"✅ {label} {_sub_bar(100)} 100%")
+            if skipped and i in skipped:
+                lines.append(f"⏭ {label} {_sub_bar(100)} Пропущен")
+            else:
+                lines.append(f"✅ {label} {_sub_bar(100)} 100%")
         elif running_idx is not None and i == running_idx:
             pct = min(99, int((running_elapsed or 0) / estimate * 100)) if estimate else 0
             lines.append(f"⏳ {label} {_sub_bar(pct)} {pct}%")
@@ -200,7 +217,7 @@ async def _advance_queue(bot) -> None:
         if not entry:
             _queue.popleft()  # their session vanished in the meantime — nothing to resume
             continue
-        if not await crud.try_acquire_slot(next_user_id, settings.max_tests_per_user, settings.max_concurrent_tests):
+        if not await crud.try_acquire_slot(next_user_id, _max_per_user(next_user_id), settings.max_concurrent_tests):
             break
         _queue.popleft()
         state = entry.pop("queue_state", None)
@@ -233,6 +250,11 @@ async def noop(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "test:new")
 async def test_new(cb: CallbackQuery, state: FSMContext) -> None:
+    if await crud.is_maintenance_mode():
+        await crud.add_maintenance_waiter(cb.from_user.id)
+        await cb.answer(await crud.get_maintenance_message(), show_alert=True)
+        return
+
     await state.clear()
     await state.set_state(TestFlow.waiting_host)
     await cb.message.edit_text(
@@ -493,7 +515,7 @@ async def _begin_connect(cb: CallbackQuery, state: FSMContext, selected_funcs: l
         await cb.answer("Вы уже в очереди — дождитесь своей очереди.", show_alert=True)
         return
 
-    limit = await _daily_limit()
+    limit = await _daily_limit(user_id)
     if limit > 0:
         used_today = await crud.count_runs_today(user_id)
         if used_today >= limit:
@@ -505,7 +527,7 @@ async def _begin_connect(cb: CallbackQuery, state: FSMContext, selected_funcs: l
 
     entry["selected_funcs"] = selected_funcs
 
-    if not await crud.try_acquire_slot(user_id, settings.max_tests_per_user, settings.max_concurrent_tests):
+    if not await crud.try_acquire_slot(user_id, _max_per_user(user_id), settings.max_concurrent_tests):
         await _enqueue(cb, state, user_id)
         return
 
@@ -670,7 +692,10 @@ async def _run_and_report(
             return
         last_edit = now
         total_elapsed = time.time() - entry["started_at"]
-        progress_text = _progress_text(creds.host, subset, completed, running_idx, running_elapsed, total_elapsed)
+        progress_text = _progress_text(
+            creds.host, subset, completed, running_idx, running_elapsed, total_elapsed,
+            skipped=run.skipped_indices,
+        )
         await _safe_edit(message, progress_text, reply_markup=kb.stop_test())
         await _mirror_admin(entry, message.bot, progress_text)
 

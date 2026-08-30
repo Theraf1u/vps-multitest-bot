@@ -162,7 +162,7 @@ def stop_test() -> InlineKeyboardMarkup:
                 icon_custom_emoji_id=icons.get("test_skip"),
             )],
             [InlineKeyboardButton(
-                text=_icon_text("test_finish_early", "📊", "Отчёт по готовым"), callback_data="test:finish_early",
+                text=_icon_text("test_finish_early", "📊", "Отчёт по готовым (прервать)"), callback_data="test:finish_early",
                 style="success", icon_custom_emoji_id=icons.get("test_finish_early"),
             )],
             [InlineKeyboardButton(
@@ -196,6 +196,19 @@ def admin_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📡 Чаты и топики", callback_data="admin:notify")],
             [InlineKeyboardButton(text="💎 Премиум-эмодзи на кнопках", callback_data="admin:icons")],
             [InlineKeyboardButton(text="📅 Лимит отчётов/сутки", callback_data="admin:daily_limit")],
+            [InlineKeyboardButton(text="🛠 Технические работы", callback_data="admin:maintenance")],
+        ]
+    )
+
+
+def admin_maintenance(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "🔴 Выключить техработы" if enabled else "🟢 Включить техработы"
+    toggle_style = "danger" if enabled else "success"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data="admin:maintenance_toggle", style=toggle_style)],
+            [InlineKeyboardButton(text="✏️ Изменить сообщение", callback_data="admin:maintenance_msg")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
 
@@ -315,7 +328,9 @@ def admin_users_list(user_ids: list[int], page: int, has_more: bool) -> InlineKe
 
 
 def admin_user_card(user_id: int, runs: list) -> InlineKeyboardMarkup:
-    rows = []
+    rows = [
+        [InlineKeyboardButton(text="📅 Лимит отчётов/сутки", callback_data=f"admin:user_limit:{user_id}")],
+    ]
     for run in runs:
         icon = {"success": "✅", "error": "❌", "cancelled": "🛑", "running": "⏳"}.get(run.status, "▫️")
         label = f"{icon} {run.started_at:%Y-%m-%d %H:%M} — {run.host}"

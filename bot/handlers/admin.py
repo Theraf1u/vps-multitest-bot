@@ -20,7 +20,7 @@ from bot.services import openrouter as orsvc
 from bot.services import security
 from bot.services.crypto import decrypt, encrypt
 from bot.handlers import test_flow
-from bot.states import AdminIcons, AdminLimits, AdminNotify, AdminOpenRouter
+from bot.states import AdminIcons, AdminLimits, AdminMaintenance, AdminNotify, AdminOpenRouter
 
 router = Router(name="admin")
 router.message.filter(F.from_user.id == settings.admin_id)
@@ -485,6 +485,118 @@ async def admin_daily_limit_set(message: Message, state: FSMContext) -> None:
     await message.answer(text, reply_markup=kb.back_to_admin())
 
 
+@router.callback_query(F.data.startswith("admin:user_limit:"))
+async def admin_user_limit(cb: CallbackQuery, state: FSMContext) -> None:
+    target_user_id = int(cb.data.split(":")[2])
+    if target_user_id == settings.admin_id:
+        await cb.answer("У админа лимитов нет — они всегда безлимитны.", show_alert=True)
+        return
+
+    await state.set_state(AdminLimits.waiting_user_daily_limit)
+    await state.update_data(target_user_id=target_user_id)
+    override = await crud.get_user_daily_limit(target_user_id)
+    if override is None:
+        global_default = await crud.get_setting("daily_report_limit", str(test_flow.DEFAULT_DAILY_LIMIT))
+        current_text = f"не задан (используется общий: {global_default})"
+    else:
+        current_text = str(override)
+    await cb.message.edit_text(
+        f"📅 Лимит отчётов в сутки для пользователя {target_user_id}: {current_text}\n\n"
+        "Отправьте новое число (0 — без лимита), либо «-» чтобы снять персональный лимит "
+        "и вернуться к общему.",
+    )
+    await cb.answer()
+
+
+@router.message(AdminLimits.waiting_user_daily_limit)
+async def admin_user_limit_set(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    if target_user_id is None:
+        await state.clear()
+        await message.reply("❌ Сессия истекла, откройте карточку пользователя заново.")
+        return
+
+    raw = (message.text or "").strip()
+    if raw == "-":
+        await crud.set_user_daily_limit(target_user_id, None)
+        await state.clear()
+        await message.answer(
+            f"✅ Персональный лимит для {target_user_id} снят — используется общий.",
+            reply_markup=kb.back_to_admin(),
+        )
+        return
+
+    try:
+        value = int(raw)
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        await message.reply("❌ Нужно целое число ≥ 0, либо «-» чтобы снять лимит. Попробуйте снова.")
+        return
+
+    await crud.set_user_daily_limit(target_user_id, value)
+    await state.clear()
+    text = (
+        f"✅ Лимит отчётов в сутки для {target_user_id}: {value}"
+        if value > 0
+        else f"✅ Лимит отчётов в сутки для {target_user_id} снят (без ограничений)."
+    )
+    await message.answer(text, reply_markup=kb.back_to_admin())
+
+
+async def _maintenance_text() -> str:
+    enabled = await crud.is_maintenance_mode()
+    msg = await crud.get_maintenance_message()
+    status = "🔴 Включены" if enabled else "🟢 Выключены"
+    return f"🛠 Технические работы: {status}\n\nСообщение пользователям:\n{msg}"
+
+
+@router.callback_query(F.data == "admin:maintenance")
+async def admin_maintenance(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    enabled = await crud.is_maintenance_mode()
+    await cb.message.edit_text(await _maintenance_text(), reply_markup=kb.admin_maintenance(enabled))
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admin:maintenance_toggle")
+async def admin_maintenance_toggle(cb: CallbackQuery) -> None:
+    enabled = await crud.is_maintenance_mode()
+    await crud.set_maintenance_mode(not enabled)
+
+    if enabled:
+        # Was on, now switching off — ping everyone who tried to start a test while it was on.
+        waiters = await crud.pop_maintenance_waiters()
+        for uid in waiters:
+            try:
+                await cb.bot.send_message(uid, "✅ Технические работы завершены — можно запускать проверку.")
+            except TelegramBadRequest:
+                pass
+
+    await cb.message.edit_text(await _maintenance_text(), reply_markup=kb.admin_maintenance(not enabled))
+    await cb.answer("Включено." if not enabled else "Выключено.")
+
+
+@router.callback_query(F.data == "admin:maintenance_msg")
+async def admin_maintenance_msg(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminMaintenance.waiting_message)
+    current = await crud.get_maintenance_message()
+    await cb.message.edit_text(f"Текущее сообщение:\n{current}\n\nОтправьте новый текст.")
+    await cb.answer()
+
+
+@router.message(AdminMaintenance.waiting_message)
+async def admin_maintenance_msg_set(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply("❌ Пустое сообщение не подходит. Попробуйте снова.")
+        return
+    await crud.set_maintenance_message(text)
+    await state.clear()
+    await message.answer("✅ Сообщение обновлено.", reply_markup=kb.back_to_admin())
+
+
 USERS_PAGE_SIZE = 10
 RUNS_PER_CARD = 8
 
@@ -520,9 +632,14 @@ async def admin_user_card(cb: CallbackQuery) -> None:
         f"👤 {uname} (id {user.id})",
         f"Первый визит: {user.first_seen:%Y-%m-%d %H:%M}",
         f"Последний визит: {user.last_seen:%Y-%m-%d %H:%M}",
-        "",
-        "Последние проверки:" if runs else "Проверок ещё не было.",
     ]
+    if user_id == settings.admin_id:
+        lines.append("📅 Лимит отчётов: без ограничений (админ)")
+    else:
+        override = await crud.get_user_daily_limit(user_id)
+        lines.append(f"📅 Персональный лимит отчётов: {override}" if override is not None else "📅 Персональный лимит отчётов: не задан")
+    lines.append("")
+    lines.append("Последние проверки:" if runs else "Проверок ещё не было.")
     await cb.message.edit_text("\n".join(lines), reply_markup=kb.admin_user_card(user_id, runs))
     await cb.answer()
 

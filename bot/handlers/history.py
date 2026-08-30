@@ -126,6 +126,11 @@ async def history_retry(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer("Не найдено.", show_alert=True)
         return
 
+    if await crud.is_maintenance_mode():
+        await crud.add_maintenance_waiter(cb.from_user.id)
+        await cb.answer(await crud.get_maintenance_message(), show_alert=True)
+        return
+
     await test_flow.cleanup_abandoned(cb.from_user.id, cb.bot)
     await state.clear()
     await state.update_data(host=run.host, port=run.port)
