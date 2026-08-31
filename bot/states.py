@@ -37,3 +37,13 @@ class AdminLimits(StatesGroup):
 
 class AdminMaintenance(StatesGroup):
     waiting_message = State()
+
+
+class RatingFlow(StatesGroup):
+    waiting_comment = State()  # data["rating_id"] tells which rating the comment is attached to
+
+
+class Broadcast(StatesGroup):
+    choosing_category = State()
+    waiting_message = State()  # data["category"]/["days"] carry the chosen segment
+    confirm = State()

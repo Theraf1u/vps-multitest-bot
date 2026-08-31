@@ -120,3 +120,21 @@ def render_pdf(
     html_str = template.render(**ctx)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     HTML(string=html_str).write_pdf(out_path)
+
+
+def render_ai_pdf(server_label: str, model: str, ai_text: str, out_path: str) -> None:
+    """Standalone one-page PDF of just an AI analysis — used for the admin "ai_usage" topic
+    mirror, separately from the full multitest report (which embeds ai_text inline instead)."""
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATE_DIR),
+        autoescape=select_autoescape(["html"]),
+    )
+    template = env.get_template("ai_report.html")
+    html_str = template.render(
+        server_label=server_label,
+        model=model,
+        ai_text=ai_text,
+        generated_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    HTML(string=html_str).write_pdf(out_path)

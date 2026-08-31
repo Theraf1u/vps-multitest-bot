@@ -91,6 +91,16 @@ def confirm_start() -> InlineKeyboardMarkup:
     )
 
 
+def confirm_all_warning() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Всё равно запустить всё", callback_data="test:confirm_all_go", style="success")],
+            [InlineKeyboardButton(text="🎯 Выбрать тесты", callback_data="test:pick", style="primary")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="test:confirm_all_back")],
+        ]
+    )
+
+
 def test_picker(selected: set[str]) -> InlineKeyboardMarkup:
     by_id = {t.id: t.label for t in TEST_CATALOG}
     numbering = category_numbering()
@@ -154,6 +164,22 @@ def ai_offer(run_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def rating_request(run_id: int) -> InlineKeyboardMarkup:
+    styles = {1: "danger", 2: "primary", 3: "primary", 4: "primary", 5: "success"}
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=str(n), callback_data=f"rate:{run_id}:{n}", style=styles[n])
+            for n in range(1, 6)
+        ]]
+    )
+
+
+def rating_thanks(rating_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="💬 Оставить комментарий", callback_data=f"rate:comment:{rating_id}")]]
+    )
+
+
 def stop_test() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -193,6 +219,7 @@ def admin_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🧪 Multitest", callback_data="admin:multitest")],
             [InlineKeyboardButton(text="🖥 Состояние бота", callback_data="admin:status")],
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:0")],
+            [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast")],
             [InlineKeyboardButton(text="📡 Чаты и топики", callback_data="admin:notify")],
             [InlineKeyboardButton(text="💎 Премиум-эмодзи на кнопках", callback_data="admin:icons")],
             [InlineKeyboardButton(text="📅 Лимит отчётов/сутки", callback_data="admin:daily_limit")],
@@ -258,6 +285,39 @@ def admin_notify_menu(categories: dict[str, str]) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=f"✏️ Топик: {title}", callback_data=f"admin:notify_set:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+BROADCAST_CATEGORIES: dict[str, str] = {
+    "all": "👥 Все пользователи",
+    "active": "🟢 Активные (за N дней)",
+    "inactive": "⚪ Неактивные (N+ дней)",
+    "limit_hit": "📅 Упёрлись в дневной лимит сегодня",
+    "never_ran": "🆕 Зарегистрированы, но ни разу не тестировали",
+}
+
+BROADCAST_DAYS_OPTIONS = (1, 3, 7, 14, 30)
+
+
+def broadcast_categories() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=title, callback_data=f"bcast:cat:{key}")] for key, title in BROADCAST_CATEGORIES.items()]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def broadcast_days(category: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"{d} дн.", callback_data=f"bcast:days:{category}:{d}") for d in BROADCAST_DAYS_OPTIONS]]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:broadcast")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def broadcast_confirm(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧪 Тестовая отправка (себе)", callback_data="bcast:test", style="primary")],
+            [InlineKeyboardButton(text=f"🚀 Отправить всем ({count})", callback_data="bcast:go", style="success")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:cancel", style="danger")],
+        ]
+    )
 
 
 def admin_multitest_menu() -> InlineKeyboardMarkup:

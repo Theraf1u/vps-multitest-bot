@@ -81,3 +81,16 @@ class RateLimit(Base):
 
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TestRating(Base):
+    """One row per 1-5 rating a user leaves after a completed test, with an optional follow-up comment."""
+
+    __tablename__ = "test_ratings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, ForeignKey("test_runs.id"))
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    rating: Mapped[int] = mapped_column(Integer)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

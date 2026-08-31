@@ -22,6 +22,8 @@ CATEGORIES: dict[str, str] = {
     "ai_usage": "🤖 AI-анализы",
     "rate_limits": "⏳ Лимиты и отказы",
     "system": "🖥 Системные события",
+    "ratings": "⭐ Оценки работы бота",
+    "broadcasts": "📢 Рассылки",
 }
 
 CHAT_KEY = "notify_chat_id"

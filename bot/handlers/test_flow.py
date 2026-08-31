@@ -550,7 +550,32 @@ async def go_with_selection(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "test:confirm", TestFlow.confirm_start)
 async def confirm_start(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.message.edit_text(
+        f"⚠️ Все тесты ({len(ALL_FUNCS)} шт.) — это может занять продолжительное время.\n\n"
+        "Всё равно запустить все, или выбрать конкретные тесты?",
+        reply_markup=kb.confirm_all_warning(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "test:confirm_all_go", TestFlow.confirm_start)
+async def confirm_all_go(cb: CallbackQuery, state: FSMContext) -> None:
     await _begin_connect(cb, state, selected_funcs=None)
+
+
+@router.callback_query(F.data == "test:confirm_all_back", TestFlow.confirm_start)
+async def confirm_all_back(cb: CallbackQuery, state: FSMContext) -> None:
+    entry = _pending.get(cb.from_user.id)
+    if not entry or not entry.get("creds"):
+        await cb.answer("Сессия истекла, начните заново.", show_alert=True)
+        await state.clear()
+        return
+    creds: sshsvc.Credentials = entry["creds"]
+    await cb.message.edit_text(
+        await confirm_start_text(cb.from_user.id, creds.host, creds.port, creds.username),
+        reply_markup=kb.confirm_start(),
+    )
+    await cb.answer()
 
 
 async def _begin_connect(cb: CallbackQuery, state: FSMContext, selected_funcs: list[str] | None) -> None:
@@ -928,6 +953,10 @@ async def _run_and_report(
     await _safe_edit(message, final_text, reply_markup=None)
     await _mirror_admin(entry, bot, final_text)
 
+    await bot.send_message(
+        message.chat.id, "Как вам работа бота? Оцените от 1 до 5:", reply_markup=kb.rating_request(run_id)
+    )
+
     _cleanup_pending(user_id)
     await _release_and_advance(user_id, bot)
     await state.clear()
@@ -1020,6 +1049,19 @@ async def run_ai_analysis(bot, user_id: int, run_id: int, payload: dict) -> orsv
         f"🤖 AI-анализ: run {run_id}, user {user_id}, модель {result.model}\n"
         f"Токены: {result.tokens_in}→{result.tokens_out}, стоимость: ${result.cost_usd:.4f}",
     )
+
+    run = await crud.get_test_run(run_id)
+    server_label = f"{run.host}:{run.port}" if run else f"run {run_id}"
+    ai_pdf_path = os.path.join(settings.reports_dir, f"ai-analysis-{user_id}-{run_id}.pdf")
+    try:
+        report_svc.render_ai_pdf(server_label, result.model, result.text, ai_pdf_path)
+        await notify.notify_document(
+            bot, "ai_usage", ai_pdf_path, f"ai-analysis-{server_label.replace(':', '_')}-{run_id}.pdf",
+            caption=f"🤖 AI-анализ (PDF): {server_label} — run {run_id}",
+        )
+    except Exception:
+        log.exception("AI analysis PDF render/send failed")
+
     return result
 
 

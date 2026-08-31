@@ -6,7 +6,16 @@ import json
 from sqlalchemy import delete, func, select, update
 
 from bot.database.db import async_session
-from bot.database.models import KnownFingerprint, OpenRouterUsage, RateLimit, Setting, TestRun, User, utcnow
+from bot.database.models import (
+    KnownFingerprint,
+    OpenRouterUsage,
+    RateLimit,
+    Setting,
+    TestRating,
+    TestRun,
+    User,
+    utcnow,
+)
 
 
 async def upsert_user(user_id: int, username: str | None) -> bool:
@@ -328,3 +337,71 @@ async def stats_summary() -> dict:
             "errors": errors or 0,
             "active": active or 0,
         }
+
+
+async def broadcast_all_user_ids() -> list[int]:
+    async with async_session() as s:
+        result = await s.execute(select(User.id))
+        return [r[0] for r in result.all()]
+
+
+async def broadcast_active_user_ids(days: int) -> list[int]:
+    """Used the bot (opened /start, or ran a test) within the last `days` days."""
+    since = utcnow() - dt.timedelta(days=days)
+    async with async_session() as s:
+        seen = await s.execute(select(User.id).where(User.last_seen >= since))
+        ran = await s.execute(select(TestRun.user_id).where(TestRun.started_at >= since).distinct())
+        return list({r[0] for r in seen.all()} | {r[0] for r in ran.all()})
+
+
+async def broadcast_inactive_user_ids(days: int) -> list[int]:
+    active_ids = set(await broadcast_active_user_ids(days))
+    all_ids = set(await broadcast_all_user_ids())
+    return list(all_ids - active_ids)
+
+
+async def broadcast_never_ran_user_ids() -> list[int]:
+    async with async_session() as s:
+        result = await s.execute(
+            select(User.id).outerjoin(TestRun, TestRun.user_id == User.id).where(TestRun.id.is_(None))
+        )
+        return [r[0] for r in result.all()]
+
+
+async def broadcast_limit_hit_user_ids() -> list[int]:
+    """Users who've already used up today's daily report-limit quota (unlimited users never
+    qualify). Mirrors the limit logic in test_flow._daily_limit, minus the admin-never-capped rule
+    since the admin isn't a broadcast target anyway."""
+    today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    async with async_session() as s:
+        result = await s.execute(
+            select(TestRun.user_id, func.count())
+            .where(TestRun.status == "success", TestRun.started_at >= today_start)
+            .group_by(TestRun.user_id)
+        )
+        counts = dict(result.all())
+
+    default_limit = int(await get_setting("daily_report_limit", "5") or "5")
+    ids = []
+    for user_id, used in counts.items():
+        override = await get_user_daily_limit(user_id)
+        limit = override if override is not None else default_limit
+        if limit and used >= limit:
+            ids.append(user_id)
+    return ids
+
+
+async def save_rating(run_id: int, user_id: int, rating: int) -> int:
+    async with async_session() as s:
+        obj = TestRating(run_id=run_id, user_id=user_id, rating=rating)
+        s.add(obj)
+        await s.commit()
+        return obj.id
+
+
+async def save_rating_comment(rating_id: int, comment: str) -> None:
+    async with async_session() as s:
+        obj = await s.get(TestRating, rating_id)
+        if obj:
+            obj.comment = comment
+            await s.commit()
