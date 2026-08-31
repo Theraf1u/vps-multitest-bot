@@ -649,8 +649,8 @@ async def admin_deluser_confirm(cb: CallbackQuery) -> None:
     uname = f"@{user.username}" if user.username else str(user.id)
     await cb.message.edit_text(
         f"⚠️ Удалить пользователя {uname} безвозвратно?\n\n"
-        "Будут стёрты: все его проверки и статистика в БД, отпечатки серверов, "
-        "данные серверов (IP/логин/пароль) и все PDF/отчёты в архиве. Отменить нельзя.",
+        "Будут стёрты: все его проверки и статистика в БД, отпечатки серверов "
+        "и все PDF/отчёты в архиве. Отменить нельзя.",
         reply_markup=kb.admin_deluser_confirm(user_id),
     )
     await cb.answer()

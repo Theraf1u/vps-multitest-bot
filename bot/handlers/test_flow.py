@@ -311,6 +311,8 @@ async def cancel_flow(cb: CallbackQuery, state: FSMContext) -> None:
         _queue.remove(cb.from_user.id)
     _cleanup_pending(cb.from_user.id)
     await _release_and_advance(cb.from_user.id, cb.bot)
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+    await _log_activity(cb.bot, cb.from_user.id, who, "🚫 Отменил ввод данных сервера")
     is_admin = cb.from_user.id == settings.admin_id
     await cb.message.edit_text(
         test_info.build_menu_intro_text(),
@@ -328,6 +330,8 @@ async def queue_leave(cb: CallbackQuery, state: FSMContext) -> None:
         _queue.remove(user_id)
     _cleanup_pending(user_id)
     await state.clear()
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(user_id)
+    await _log_activity(cb.bot, user_id, who, "🚫 Покинул очередь")
     is_admin = user_id == settings.admin_id
     await cb.message.edit_text(
         "🚫 Вы покинули очередь.\n\n👋 Нажмите кнопку ниже, чтобы начать заново.",
@@ -463,6 +467,11 @@ async def got_password(message: Message, state: FSMContext) -> None:
     _pending[message.from_user.id] = {
         "creds": sshsvc.Credentials(host=host, port=port, username=login, password=password)
     }
+    who = f"@{message.chat.username}" if message.chat.username else str(message.from_user.id)
+    await _log_activity(
+        message.bot, message.from_user.id, who,
+        f"🔑 Ввёл данные для входа: {host}:{port} (логин {login})",
+    )
     await state.set_state(TestFlow.confirm_start)
     await message.answer(
         await confirm_start_text(message.from_user.id, host, port, login),
@@ -472,6 +481,8 @@ async def got_password(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "test:pick", TestFlow.confirm_start)
 async def pick_tests(cb: CallbackQuery, state: FSMContext) -> None:
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+    await _log_activity(cb.bot, cb.from_user.id, who, "🎯 Перешёл к выбору конкретных тестов")
     await state.update_data(selected=[])
     await state.set_state(TestFlow.picking_tests)
     await cb.message.edit_text(
@@ -565,6 +576,9 @@ async def _begin_connect(cb: CallbackQuery, state: FSMContext, selected_funcs: l
             return
 
     entry["selected_funcs"] = selected_funcs
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(user_id)
+    choice_note = f"выбрано тестов: {len(selected_funcs)}" if selected_funcs else "все тесты"
+    await _log_activity(cb.bot, user_id, who, f"✅ Подтвердил запуск ({choice_note})")
 
     if not await crud.try_acquire_slot(user_id, _max_per_user(user_id), settings.max_concurrent_tests):
         await _enqueue(cb, state, user_id)
@@ -653,6 +667,8 @@ async def confirm_fingerprint(cb: CallbackQuery, state: FSMContext) -> None:
         return
     creds: sshsvc.Credentials = entry["creds"]
     await crud.remember_fingerprint(user_id, creds.host, creds.port, entry["fingerprint"])
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(user_id)
+    await _log_activity(cb.bot, user_id, who, f"🔏 Подтвердил отпечаток сервера: {creds.host}:{creds.port}")
     await cb.answer()
     await _proceed_after_fingerprint(cb.message, state, user_id)
 
@@ -926,6 +942,8 @@ async def manual_reconnect(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer("Сессия истекла — начните заново.", show_alert=True)
         return
     entry.pop("awaiting_reconnect", None)
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(user_id)
+    await _log_activity(cb.bot, user_id, who, "🔄 Запросил переподключение вручную")
     await cb.answer()
     reconnect_text = "🔄 Пробую переподключиться..."
     await _safe_edit(cb.message, reconnect_text, reply_markup=None)
@@ -945,6 +963,8 @@ async def reconnect_cancel(cb: CallbackQuery, state: FSMContext) -> None:
         asyncio.create_task(mt_run.abandon())  # best-effort remote cleanup, don't block the UI on it
     if run_id is not None:
         await crud.finish_test_run(run_id, "cancelled", 0, 0, error="Соединение потеряно, пользователь отменил")
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(user_id)
+    await _log_activity(cb.bot, user_id, who, "🛑 Отменил после потери связи (переподключаться не стал)")
     await _release_and_advance(user_id, cb.bot)
     await state.clear()
     is_admin = user_id == settings.admin_id
@@ -1019,6 +1039,9 @@ async def ai_analyze(cb: CallbackQuery) -> None:
     await cb.answer()
     model = await crud.get_setting("openrouter_model", settings.openrouter_model)
     await _safe_edit(cb.message, f"🤖 Анализирую отчёт через {model}... ⏳")
+
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+    await _log_activity(cb.bot, cb.from_user.id, who, f"🤖 Запросил AI-анализ отчёта: {entry['server_label']}")
 
     result = await run_ai_analysis(cb.bot, cb.from_user.id, run_id, entry["payload"])
     if result is None:

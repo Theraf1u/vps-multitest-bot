@@ -28,8 +28,13 @@ async def back_to_menu(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+def _who(cb: CallbackQuery) -> str:
+    return f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+
+
 @router.callback_query(F.data == "info:tests")
 async def show_test_info(cb: CallbackQuery) -> None:
+    await test_flow._log_activity(cb.bot, cb.from_user.id, _who(cb), "📋 Посмотрел описание тестов")
     await cb.message.edit_text(
         test_info.build_test_info_text(),
         reply_markup=kb.back_to_main_menu(),
@@ -42,6 +47,8 @@ async def show_test_info(cb: CallbackQuery) -> None:
 async def history_list(cb: CallbackQuery) -> None:
     page = int(cb.data.split(":")[2])
     user_id = cb.from_user.id
+    if page == 0:  # только первый заход в историю, не каждое пролистывание страниц
+        await test_flow._log_activity(cb.bot, user_id, _who(cb), "📜 Открыл историю проверок")
     runs = await crud.list_user_runs(user_id, limit=PAGE_SIZE * (page + 1) + 1)
     page_runs = runs[page * PAGE_SIZE : page * PAGE_SIZE + PAGE_SIZE]
     has_more = len(runs) > page * PAGE_SIZE + PAGE_SIZE
@@ -62,6 +69,10 @@ async def history_item(cb: CallbackQuery) -> None:
     if not run or run.user_id != cb.from_user.id:
         await cb.answer("Не найдено.", show_alert=True)
         return
+
+    await test_flow._log_activity(
+        cb.bot, cb.from_user.id, _who(cb), f"📄 Открыл детали прогона #{run_id}: {run.host}:{run.port}"
+    )
 
     base = archive.find_report_base(cb.from_user.id, run_id)
     has_pdf = bool(base and archive.report_pdf_path(cb.from_user.id, base))
@@ -112,6 +123,9 @@ async def history_cancel(cb: CallbackQuery) -> None:
     if run.status != "running" or not await test_flow.cancel_running(cb.from_user.id):
         await cb.answer("Этот тест уже не выполняется.", show_alert=True)
         return
+    await test_flow._log_activity(
+        cb.bot, cb.from_user.id, _who(cb), f"🛑 Остановил тест из истории: {run.host}:{run.port}"
+    )
     await cb.answer("Останавливаю...")
     await cb.message.edit_text("🛑 Останавливаю тест и удаляю временные файлы на сервере...")
 
@@ -130,6 +144,10 @@ async def history_retry(cb: CallbackQuery, state: FSMContext) -> None:
         await crud.add_maintenance_waiter(cb.from_user.id)
         await cb.answer(await crud.get_maintenance_message(), show_alert=True)
         return
+
+    await test_flow._log_activity(
+        cb.bot, cb.from_user.id, _who(cb), f"🔄 Повторил тест из истории: {run.host}:{run.port}"
+    )
 
     await test_flow.cleanup_abandoned(cb.from_user.id, cb.bot)
     await state.clear()
@@ -158,6 +176,9 @@ async def history_ai(cb: CallbackQuery) -> None:
     await cb.answer()
     model = await crud.get_setting("openrouter_model", settings.openrouter_model)
     await cb.message.edit_text(f"🤖 Анализирую отчёт через {model}... ⏳", reply_markup=None)
+    await test_flow._log_activity(
+        cb.bot, cb.from_user.id, _who(cb), f"🤖 Запросил AI-анализ из истории: {run.host}:{run.port}"
+    )
 
     result = await test_flow.run_ai_analysis(cb.bot, cb.from_user.id, run_id, payload)
     if result is None:
@@ -190,4 +211,7 @@ async def history_pdf(cb: CallbackQuery) -> None:
     await cb.answer()
     await cb.message.answer_document(
         FSInputFile(pdf_path, filename=archive.report_filename(run.host, run.started_at.strftime("%Y-%m-%d")))
+    )
+    await test_flow._log_activity(
+        cb.bot, cb.from_user.id, _who(cb), f"📄 Запросил повторную отправку PDF из истории: {run.host}:{run.port}"
     )

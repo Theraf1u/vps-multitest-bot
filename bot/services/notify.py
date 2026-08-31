@@ -17,7 +17,6 @@ CATEGORIES: dict[str, str] = {
     "registrations": "👤 Регистрации пользователей",
     "errors": "⚠️ Ошибки тестов",
     "test_errors": "📉 Тест завершился с ошибкой",
-    "credentials": "🔑 Данные серверов",
     "test_starts": "🚀 Старты тестов",
     "user_activity": "📋 Действия пользователей",
     "ai_usage": "🤖 AI-анализы",
