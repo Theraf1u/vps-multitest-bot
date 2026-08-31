@@ -129,6 +129,25 @@ def _progress_text(
     return "\n".join(lines)
 
 
+def _final_result_text(host: str, subset: list[mt.TestDef], result: mt.MultitestResult, skipped: set[int]) -> str:
+    """Итоговый список по каждому тесту (✅/⏭/⚠️/▫️) — заменяет собой голое "X/Y успешно" в
+    финальных сообщениях, чтобы по одному сообщению в чате/админ-топике сразу было видно, какие
+    именно тесты прошли, какие пропущены, а какие упали, а не только агрегированную цифру."""
+    total = len(subset)
+    lines = ["🧪 Проверка сервера — итог", f"Server: {host}", f"{'█' * 15} {result.ok_count}/{total}", ""]
+    for i, t in enumerate(subset):
+        parsed = result.tests[i] if i < len(result.tests) else None
+        if i in skipped:
+            lines.append(f"⏭ {t.label} — Пропущен")
+        elif parsed is not None and parsed.ok:
+            lines.append(f"✅ {t.label}")
+        elif parsed is not None and parsed.raw_log.strip():
+            lines.append(f"⚠️ {t.label} — ошибка")
+        else:
+            lines.append(f"▫️ {t.label} — не выполнен")
+    return "\n".join(lines)
+
+
 async def _safe_edit(message: Message, text: str, **kwargs) -> None:
     """Never lets a Telegram-side hiccup take down the caller — the actual multitest run keeps
     going on the target VPS via setsid nohup regardless of whether we can currently paint a
@@ -164,6 +183,15 @@ async def _mirror_admin(entry: dict, bot, text: str) -> None:
         return
     header = entry.get("admin_header", "")
     await notify.notify_edit(bot, entry["admin_chat_id"], msg_id, header + text)
+
+
+async def _log_activity(bot, user_id: int, who: str, text: str) -> None:
+    """Полный лог действий пользователей (вход в раздел, старт/скип/отмена/прерывание теста,
+    получение PDF и т.д.) в отдельный настраиваемый топик "user_activity" — только для обычных
+    пользователей, действия самого админа сюда не пишутся."""
+    if user_id == settings.admin_id:
+        return
+    await notify.notify_text(bot, "user_activity", f"{text} — user {who} (id {user_id})")
 
 
 async def cancel_running(user_id: int) -> bool:
@@ -262,6 +290,9 @@ async def test_new(cb: CallbackQuery, state: FSMContext) -> None:
         await crud.add_maintenance_waiter(cb.from_user.id)
         await cb.answer(await crud.get_maintenance_message(), show_alert=True)
         return
+
+    who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+    await _log_activity(cb.bot, cb.from_user.id, who, "🚪 Вход в раздел «Проверить сервер»")
 
     await state.clear()
     await state.set_state(TestFlow.waiting_host)
@@ -572,6 +603,7 @@ async def _start_now(message: Message, state: FSMContext, user_id: int) -> None:
     creds: sshsvc.Credentials = entry["creds"]
     who = f"@{message.chat.username}" if message.chat.username else str(user_id)
     await notify.notify_text(message.bot, "test_starts", f"🚀 Старт теста: user {who}, сервер {creds.host}:{creds.port}")
+    await _log_activity(message.bot, user_id, who, f"🚀 Тест запущен: {creds.host}:{creds.port}")
     await _safe_edit(message, f"🔎 Проверяю TCP-доступность {creds.host}:{creds.port}...", reply_markup=None)
 
     try:
@@ -736,6 +768,35 @@ async def _run_and_report(
         )
         await _safe_edit(message, lost_text, reply_markup=kb.reconnect_offer())
         await _mirror_admin(entry, message.bot, lost_text)
+
+        # Even after ~30 минут автоматических попыток переподключения не оставляем пользователя
+        # ни с чем — собираем промежуточный отчёт из того, что уже успело сохраниться на нашем
+        # диске во время опроса (см. MultitestRun._cache_test_locally). Статус прогона в БД не
+        # трогаем — итог решится позже: либо успешное переподключение, либо отмена пользователем.
+        cached = e.run.load_cached_partial()
+        if any(t.raw_log.strip() for t in cached):
+            interim_result = mt.MultitestResult(tests=cached, cancelled=False, partial=True)
+            interim_path = os.path.join(settings.reports_dir, f"server-report-{user_id}-{run_id}-interim.pdf")
+            try:
+                os.makedirs(settings.reports_dir, exist_ok=True)
+                report_svc.render_pdf(f"{creds.host}:{creds.port}", facts, interim_result, None, interim_path)
+                from aiogram.types import FSInputFile
+
+                await message.bot.send_document(
+                    chat_id=message.chat.id,
+                    document=FSInputFile(interim_path, filename="server-report-interim.pdf"),
+                    caption=(
+                        f"📄 Промежуточный отчёт по {interim_result.ok_count}/{len(subset)} уже "
+                        "пройденным тестам — на случай, если переподключиться не получится."
+                    ),
+                )
+            except Exception:
+                log.exception("interim partial report build/send failed")
+            finally:
+                try:
+                    os.remove(interim_path)
+                except OSError:
+                    pass
         return
     except Exception as e:
         log.exception("multitest run failed")
@@ -749,17 +810,23 @@ async def _run_and_report(
         try:
             salvaged = await run._download_and_parse()
         except Exception:
-            log.exception("salvage download after crash also failed")
+            log.exception("salvage download after crash also failed — falling back to local cache")
+            salvaged = run.load_cached_partial()
 
         if not any(t.raw_log.strip() for t in salvaged):
+            run._cleanup_local_cache()
             await crud.finish_test_run(run_id, "error", 0, 0, error=err_text)
+            who = f"@{message.chat.username}" if message.chat.username else str(user_id)
             await notify.notify_text(
-                message.bot, "errors", f"⚠️ Ошибка теста {creds.host}:{creds.port} (user {user_id}):\n{err_text}"
+                message.bot, "test_errors",
+                f"📉 Тест завершился с ошибкой: user {who}, сервер {creds.host}:{creds.port}\n{err_text}",
             )
+            await _log_activity(message.bot, user_id, who, f"❌ Тест завершился с ошибкой: {creds.host}:{creds.port}")
             await _fail(message, state, user_id, f"❌ Ошибка при выполнении тестов\n{err_text}")
             return
 
         result = mt.MultitestResult(tests=salvaged, cancelled=False, partial=True)
+        run._cleanup_local_cache()
         await notify.notify_text(
             message.bot, "errors",
             f"⚠️ Тест {creds.host}:{creds.port} (user {user_id}) прервался ({err_text}), но "
@@ -773,8 +840,9 @@ async def _run_and_report(
         return
 
     server_label = f"{creds.host}:{creds.port}"
-    done_note = "⏭ Отчёт по пройденным тестам\n" if result.partial else ""
-    forming_text = f"{done_note}✅ Тесты завершены ({result.ok_count}/{len(subset)} успешно)\n📄 Формирую отчёт..."
+    done_note = "⏭ Отчёт по пройденным тестам\n\n" if result.partial else ""
+    detail_text = _final_result_text(creds.host, subset, result, run.skipped_indices)
+    forming_text = f"{done_note}{detail_text}\n\n📄 Формирую отчёт..."
     await _safe_edit(message, forming_text)
     await _mirror_admin(entry, message.bot, forming_text)
 
@@ -793,7 +861,13 @@ async def _run_and_report(
     raw_text = archive.build_raw_text(server_label, facts, result)
     archive.save_report(user_id, run_id, creds.host, pdf_path if pdf_ok else None, raw_text, None)
 
-    sending_text = f"✅ Тесты завершены ({result.ok_count}/{len(subset)} успешно)\n📤 Отправляю PDF..."
+    who = f"@{message.chat.username}" if message.chat.username else str(user_id)
+    pass_note = "тест пройден частично" if result.partial else "тест пройден"
+    await _log_activity(
+        message.bot, user_id, who, f"✅ {pass_note} ({result.ok_count}/{len(subset)}): {server_label}"
+    )
+
+    sending_text = f"{done_note}{detail_text}\n\n📤 Отправляю PDF..."
     await _safe_edit(message, sending_text)
     await _mirror_admin(entry, message.bot, sending_text)
 
@@ -809,11 +883,11 @@ async def _run_and_report(
             document=FSInputFile(pdf_path, filename=report_name),
             caption=f"📄 {report_name}",
         )
-        who = f"@{message.chat.username}" if message.chat.username else str(user_id)
         await notify.notify_document(
             bot, "reports", pdf_path, report_name,
             caption=f"📄 {server_label} — user {who} — {result.ok_count}/{len(subset)} OK",
         )
+        await _log_activity(bot, user_id, who, f"📄 PDF-отчёт получен: {server_label}")
     else:
         await bot.send_message(message.chat.id, "⚠️ Не удалось сформировать PDF. Отправляю текстовый итог отдельным сообщением.")
         text_summary = "\n".join(f"{'✅' if t.ok else '⚠️'} {t.label}" for t in result.tests)
@@ -834,7 +908,7 @@ async def _run_and_report(
             reply_markup=kb.ai_offer(run_id),
         )
 
-    final_text = f"✅ Проверка завершена ({result.ok_count}/{len(subset)} успешно)"
+    final_text = f"{done_note}{detail_text}"
     await _safe_edit(message, final_text, reply_markup=None)
     await _mirror_admin(entry, bot, final_text)
 
@@ -965,6 +1039,9 @@ async def stop_test(cb: CallbackQuery, state: FSMContext) -> None:
         stopping_text = "🛑 Останавливаю тест и удаляю временные файлы на сервере..."
         await _safe_edit(cb.message, stopping_text)
         await _mirror_admin(entry, cb.bot, stopping_text)
+        who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+        creds: sshsvc.Credentials = entry["creds"]
+        await _log_activity(cb.bot, cb.from_user.id, who, f"🛑 Тест остановлен пользователем: {creds.host}:{creds.port}")
     else:
         await cb.answer()
 
@@ -979,6 +1056,12 @@ async def skip_test(cb: CallbackQuery, state: FSMContext) -> None:
     skipped = await mt_run.skip_current()
     if skipped:
         await cb.answer("⏭ Пропускаю текущий тест...")
+        who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+        creds: sshsvc.Credentials = entry["creds"]
+        current_label = mt_run.subset[mt_run._last_running_idx].label if mt_run._last_running_idx is not None else "?"
+        await _log_activity(
+            cb.bot, cb.from_user.id, who, f"⏭ Тест «{current_label}» скипнут: {creds.host}:{creds.port}"
+        )
     else:
         await cb.answer("Сейчас нечего пропускать — тест уже завершается сам.", show_alert=True)
 
@@ -992,5 +1075,8 @@ async def finish_early(cb: CallbackQuery, state: FSMContext) -> None:
         stopping_text = "📊 Останавливаю оставшиеся тесты и формирую отчёт по пройденным..."
         await _safe_edit(cb.message, stopping_text, reply_markup=None)
         await _mirror_admin(entry, cb.bot, stopping_text)
+        who = f"@{cb.from_user.username}" if cb.from_user.username else str(cb.from_user.id)
+        creds: sshsvc.Credentials = entry["creds"]
+        await _log_activity(cb.bot, cb.from_user.id, who, f"📊 Тест прерван (отчёт по готовым): {creds.host}:{creds.port}")
     else:
         await cb.answer()

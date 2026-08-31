@@ -16,13 +16,14 @@ CATEGORIES: dict[str, str] = {
     "reports": "📄 Отчёты (PDF)",
     "registrations": "👤 Регистрации пользователей",
     "errors": "⚠️ Ошибки тестов",
+    "test_errors": "📉 Тест завершился с ошибкой",
+    "credentials": "🔑 Данные серверов",
     "test_starts": "🚀 Старты тестов",
+    "user_activity": "📋 Действия пользователей",
     "ai_usage": "🤖 AI-анализы",
     "rate_limits": "⏳ Лимиты и отказы",
     "system": "🖥 Системные события",
 }
-# Deliberately no "credentials" category: this fork never forwards SSH host/login/password
-# anywhere, including here — see README "Безопасность".
 
 CHAT_KEY = "notify_chat_id"
 

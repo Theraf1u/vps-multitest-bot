@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import tarfile
 import time
 import uuid
@@ -299,12 +300,43 @@ class MultitestError(Exception):
 
 
 # Reconnect schedule for a dropped SSH connection mid-run: a burst of quick attempts first
-# (covers a blip), then — if those all failed — one longer wait and a couple more tries (covers
-# a longer network hiccup) before giving up and asking the user to retry manually.
-RECONNECT_IMMEDIATE_ATTEMPTS = 3
-RECONNECT_IMMEDIATE_DELAY = 8.0
-RECONNECT_DELAYED_ATTEMPTS = 2
-RECONNECT_DELAYED_WAIT = 180.0
+# (covers a blip), then — if those all failed — many longer-spaced retries (covers the target
+# VPS rebooting, a longer network outage, etc.) before finally giving up and asking the user to
+# retry manually. ~6 immediate attempts (~1 min) + 20 delayed attempts 90s apart (~30 min) — a
+# user shouldn't sit through an hour-long test only to get a bare "cancelled" from one blip;
+# see the local per-test result cache below (_cache_test_locally/load_cached_partial) for the
+# other half of this: even if every one of these attempts fails, nothing already completed is
+# lost, since it was already saved to our own disk as it finished.
+RECONNECT_IMMEDIATE_ATTEMPTS = 6
+RECONNECT_IMMEDIATE_DELAY = 10.0
+RECONNECT_DELAYED_ATTEMPTS = 20
+RECONNECT_DELAYED_WAIT = 90.0
+
+# Per-test watchdog: if one single test has been "running" way longer than its own estimate,
+# something on the target is stuck (a hung dependency install, a script waiting on input that'll
+# never come, etc.) — auto-skip it (same mechanism as the "⏭ Скипнуть тест" button) rather than
+# let one frozen test hold the whole run hostage forever. A flat ceiling would be unfair either
+# way — 40 min is nothing for a 25-second CPU test to hang, but too tight for extra_sustained_load
+# (its own internal server-retry logic can legitimately run ~7 min) — so each test gets its own
+# ceiling scaled off `estimated_secs`, bounded by a floor (short tests still get a real leash) and
+# a hard cap (nothing waits forever even if its estimate is huge). NetQuality's worst observed run
+# (~29 min on a cold first-run installing nexttrace/speedtest-cli/iperf3/mtr) comfortably fits.
+TEST_HANG_MULTIPLIER = 4.0
+TEST_HANG_FLOOR = 300.0  # 5 минут
+TEST_HANG_CEILING = 2400.0  # 40 минут
+
+
+def _hang_timeout_for(t: "TestDef") -> float:
+    return min(max(t.estimated_secs * TEST_HANG_MULTIPLIER, TEST_HANG_FLOOR), TEST_HANG_CEILING)
+
+# A half-dead connection (packets black-holed by the network rather than a clean TCP reset)
+# never raises OSError/asyncssh.Error on its own — asyncssh just waits forever for a reply that
+# isn't coming. Every remote command/SFTP operation below is bounded by one of these so a stall
+# gets treated as a dropped connection (-> _reconnect) instead of hanging the whole run forever
+# with the progress bar frozen and nothing in the logs to explain why.
+POLL_COMMAND_TIMEOUT = 30.0
+CMD_TIMEOUT = 30.0
+SFTP_TIMEOUT = 60.0
 
 StatusCallback = Callable[[str], Awaitable[None]]
 
@@ -532,35 +564,52 @@ class MultitestRun:
         self._last_running_idx: int | None = None  # 0-based index of the test polling last saw as "running"
         self.skipped_indices: set[int] = set()  # 0-based indices skipped via skip_current()
 
-    async def _upload_scripts(self) -> None:
-        async with self.conn.start_sftp_client() as sftp:
-            await sftp.put(_vendor_path(), self.remote_vendor)
+        # Our own local backup of each test's result, written the moment polling first sees it
+        # complete — independent of the SSH connection to the target surviving afterward. If
+        # reconnecting is later exhausted entirely (target gone for good, credentials revoked,
+        # whatever), this is what a report gets salvaged from instead of nothing. See
+        # _cache_test_locally / load_cached_partial.
+        self.local_cache_dir = os.path.join(settings.reports_dir, "_partial_cache", self.run_id)
+        self._cached_indices: set[int] = set()  # 1-based test indices already saved to local_cache_dir
 
-            # Each "shell"-kind test's command goes into its own file rather than being
-            # embedded inline in the runner script text — several of these commands contain
-            # double quotes, `<()`, `|`, etc. and writing them as file bytes over SFTP sidesteps
-            # any shell-quoting headaches entirely.
-            for idx, t in enumerate(self.subset, start=1):
-                if t.kind != "shell":
-                    continue
-                cmd_path = f"{REMOTE_TMP_PREFIX}{self.run_id}-cmd-{idx}.sh"
-                self._cmd_files.append(cmd_path)
-                async with sftp.open(cmd_path, "w") as f:
-                    await f.write(t.payload + "\n")
+    async def _run(self, cmd: str, check: bool = False, timeout: float = CMD_TIMEOUT):
+        """self.conn.run(...) bounded by a timeout — see the module-level comment above
+        POLL_COMMAND_TIMEOUT for why this matters. Raises asyncio.TimeoutError just like a
+        connection error would, so callers that already handle (OSError, asyncssh.Error) should
+        catch that too."""
+        return await asyncio.wait_for(self.conn.run(cmd, check=check), timeout=timeout)
+
+    async def _upload_scripts(self) -> None:
+        async with asyncio.timeout(SFTP_TIMEOUT):
+            async with self.conn.start_sftp_client() as sftp:
+                await sftp.put(_vendor_path(), self.remote_vendor)
+
+                # Each "shell"-kind test's command goes into its own file rather than being
+                # embedded inline in the runner script text — several of these commands contain
+                # double quotes, `<()`, `|`, etc. and writing them as file bytes over SFTP
+                # sidesteps any shell-quoting headaches entirely.
+                for idx, t in enumerate(self.subset, start=1):
+                    if t.kind != "shell":
+                        continue
+                    cmd_path = f"{REMOTE_TMP_PREFIX}{self.run_id}-cmd-{idx}.sh"
+                    self._cmd_files.append(cmd_path)
+                    async with sftp.open(cmd_path, "w") as f:
+                        await f.write(t.payload + "\n")
 
         cmd_path_by_test_id = dict(zip((t.id for t in self.subset if t.kind == "shell"), self._cmd_files))
         runner = build_runner_script(self.remote_vendor, self.summary_dir, self.subset, cmd_path_by_test_id)
 
-        async with self.conn.start_sftp_client() as sftp:
-            async with sftp.open(self.remote_runner, "w") as f:
-                await f.write(runner)
+        async with asyncio.timeout(SFTP_TIMEOUT):
+            async with self.conn.start_sftp_client() as sftp:
+                async with sftp.open(self.remote_runner, "w") as f:
+                    await f.write(runner)
 
     async def _launch(self) -> None:
         cmd = (
             f"setsid nohup bash {self.remote_runner} > {self.remote_out} 2>&1 < /dev/null & "
             f"echo LAUNCHED_PID:$!"
         )
-        result = await self.conn.run(cmd, check=False)
+        result = await self._run(cmd)
         m = re.search(r"LAUNCHED_PID:(\d+)", result.stdout or "")
         if not m:
             raise MultitestError("Не удалось запустить Multitest на сервере.")
@@ -576,16 +625,16 @@ class MultitestRun:
             pass
 
         attempt = 0
-        schedule = [0.0] * RECONNECT_IMMEDIATE_ATTEMPTS + [RECONNECT_DELAYED_WAIT] + [0.0] * (
-            RECONNECT_DELAYED_ATTEMPTS - 1
-        )
+        total_attempts = RECONNECT_IMMEDIATE_ATTEMPTS + RECONNECT_DELAYED_ATTEMPTS
+        schedule = [0.0] * RECONNECT_IMMEDIATE_ATTEMPTS + [RECONNECT_DELAYED_WAIT] * RECONNECT_DELAYED_ATTEMPTS
         for i, wait_before in enumerate(schedule):
             if wait_before:
                 if on_status:
-                    minutes = int(wait_before / 60)
+                    minutes = max(1, round(wait_before / 60))
                     await on_status(
                         f"⏳ Не удалось переподключиться сразу ({attempt} попыт.). "
-                        f"Повторю попытку через {minutes} мин — тест на сервере продолжает идти."
+                        f"Произошёл сбой связи, провожу переподключение — следующая попытка через "
+                        f"~{minutes} мин ({attempt}/{total_attempts}). Тест на сервере продолжает идти."
                     )
                 await asyncio.sleep(wait_before)
             elif i > 0:
@@ -593,7 +642,9 @@ class MultitestRun:
 
             attempt += 1
             if on_status:
-                await on_status(f"⚠️ Связь с сервером прервалась. Переподключаюсь... (попытка {attempt})")
+                await on_status(
+                    f"⚠️ Связь с сервером прервалась. Переподключаюсь... (попытка {attempt}/{total_attempts})"
+                )
             try:
                 self.conn = await sshsvc.connect(self.creds, timeout=settings.ssh_connect_timeout)
             except Exception:
@@ -614,18 +665,24 @@ class MultitestRun:
         # reporting fractional progress themselves.
         start_times: list[float | None] = [None] * total
         checks_since_any_progress = 0
+        cached_up_to = 0
 
         while True:
             if self._cancelled:
                 return
             try:
-                result = await self.conn.run(
+                result = await self._run(
                     f"ls -1 {self.summary_dir}/*.metrics 2>/dev/null; echo ---; "
                     f"ls -1 {self.summary_dir}/test-*.log 2>/dev/null; echo ---; "
                     f"cat {self.remote_out} 2>/dev/null | grep -c ___MULTITEST_DONE___",
-                    check=False,
+                    timeout=POLL_COMMAND_TIMEOUT,
                 )
-            except (OSError, asyncssh.Error):
+            except (OSError, asyncssh.Error, asyncio.TimeoutError):
+                # A silently half-dead connection (network black-holing packets rather than
+                # cleanly resetting) never raises OSError/asyncssh.Error on its own — the `run`
+                # call just hangs forever with no exception, no progress update, and no chance
+                # to ever reconnect. Bound it explicitly so a stall gets treated exactly like any
+                # other dropped connection instead of freezing the progress bar permanently.
                 if self._cancelled:
                     return
                 if not await self._reconnect(on_status):
@@ -655,6 +712,22 @@ class MultitestRun:
                 running_elapsed = time.monotonic() - start_times[running_idx]
             self._last_running_idx = running_idx
 
+            if running_idx is not None and running_elapsed is not None and running_idx not in self.skipped_indices:
+                hang_limit = _hang_timeout_for(self.subset[running_idx])
+                if running_elapsed > hang_limit:
+                    label = self.subset[running_idx].label
+                    if on_status:
+                        await on_status(
+                            f"⏱ Тест «{label}» завис (идёт дольше {int(hang_limit // 60)} мин) — "
+                            "пропускаю автоматически, продолжаю остальные."
+                        )
+                    await self.skip_current()
+
+            if completed > cached_up_to:
+                for finished_idx in range(cached_up_to + 1, completed + 1):
+                    await self._cache_test_locally(finished_idx)
+                cached_up_to = completed
+
             if on_progress:
                 await on_progress(completed, running_idx, running_elapsed)
 
@@ -666,9 +739,9 @@ class MultitestRun:
             if completed == 0 and running_idx is None:
                 checks_since_any_progress += 1
                 if checks_since_any_progress >= 3:
-                    check = await self.conn.run(f"kill -0 {self._launch_pid} 2>/dev/null; echo $?", check=False)
+                    check = await self._run(f"kill -0 {self._launch_pid} 2>/dev/null; echo $?")
                     if (check.stdout or "").strip() != "0":
-                        tail = await self.conn.run(f"cat {self.remote_out} 2>/dev/null | tail -40", check=False)
+                        tail = await self._run(f"cat {self.remote_out} 2>/dev/null | tail -40")
                         raise MultitestError(
                             "Multitest завершился, не начав тесты. Хвост вывода:\n"
                             f"{(tail.stdout or '').strip()[-800:]}"
@@ -682,11 +755,11 @@ class MultitestRun:
         self._cancelled = True
         try:
             if self._launch_pid:
-                await self.conn.run(f"kill -TERM -{self._launch_pid} 2>/dev/null", check=False)
+                await self._run(f"kill -TERM -{self._launch_pid} 2>/dev/null")
                 await asyncio.sleep(1)
-                await self.conn.run(f"kill -KILL -{self._launch_pid} 2>/dev/null", check=False)
-            await self.conn.run(f"pkill -9 -f '{self.summary_dir}' 2>/dev/null", check=False)
-        except (OSError, asyncssh.Error):
+                await self._run(f"kill -KILL -{self._launch_pid} 2>/dev/null")
+            await self._run(f"pkill -9 -f '{self.summary_dir}' 2>/dev/null")
+        except (OSError, asyncssh.Error, asyncio.TimeoutError):
             pass  # connection already dead — nothing more we can do from here
 
     async def skip_current(self) -> bool:
@@ -699,27 +772,94 @@ class MultitestRun:
             return False
         pidfile = f"{self.summary_dir}/test-{idx + 1}.pid"
         try:
-            result = await self.conn.run(f"cat {pidfile} 2>/dev/null", check=False)
+            result = await self._run(f"cat {pidfile} 2>/dev/null")
             pid = (result.stdout or "").strip()
             if not pid:
                 return False
-            await self.conn.run(f"kill -TERM -{pid} 2>/dev/null", check=False)
+            await self._run(f"kill -TERM -{pid} 2>/dev/null")
             await asyncio.sleep(1)
-            await self.conn.run(f"kill -KILL -{pid} 2>/dev/null", check=False)
+            await self._run(f"kill -KILL -{pid} 2>/dev/null")
             self.skipped_indices.add(idx)
             return True
-        except (OSError, asyncssh.Error):
+        except (OSError, asyncssh.Error, asyncio.TimeoutError):
             return False
+
+    async def _cache_test_locally(self, idx: int) -> None:
+        """Copies one just-finished test's raw files (log/metrics/services) to our own disk —
+        called from _poll_progress the moment it sees that test complete, so the data survives
+        on our side regardless of whether the SSH connection to the target is ever seen again.
+        Best-effort: a failure here (connection already flaky) just means this one test isn't
+        backed up yet — the next poll tick that still sees it as "completed" retries it, since
+        `idx` only gets added to _cached_indices on success."""
+        if idx in self._cached_indices:
+            return
+        t = self.subset[idx - 1]
+        key = t.payload if t.kind == "vendor" else t.id
+        try:
+            os.makedirs(self.local_cache_dir, exist_ok=True)
+            async with asyncio.timeout(SFTP_TIMEOUT):
+                async with self.conn.start_sftp_client() as sftp:
+                    for remote_name, local_name in (
+                        (f"test-{idx}.log", f"{idx}.log"),
+                        (f"{key}.metrics", f"{idx}.metrics"),
+                        (f"{key}.services", f"{idx}.services"),
+                    ):
+                        data = b""
+                        try:
+                            async with sftp.open(f"{self.summary_dir}/{remote_name}", "rb") as rf:
+                                data = await rf.read()
+                        except (OSError, asyncssh.SFTPError):
+                            pass  # that particular file may not exist for this test kind — fine
+                        with open(os.path.join(self.local_cache_dir, local_name), "wb") as lf:
+                            lf.write(data)
+            self._cached_indices.add(idx)
+        except (OSError, asyncssh.Error, asyncio.TimeoutError):
+            pass
+
+    def load_cached_partial(self) -> list[ParsedTest]:
+        """Best-effort reconstruction of results purely from our own local backup — usable even
+        with zero live connection to the target. The ultimate fallback once reconnecting has
+        been exhausted entirely (see RECONNECT_* above)."""
+        results: list[ParsedTest] = []
+        for idx, t in enumerate(self.subset, start=1):
+            log_text, metrics_raw, services_raw = "", b"", b""
+            log_path = os.path.join(self.local_cache_dir, f"{idx}.log")
+            metrics_path = os.path.join(self.local_cache_dir, f"{idx}.metrics")
+            services_path = os.path.join(self.local_cache_dir, f"{idx}.services")
+            if os.path.isfile(log_path):
+                with open(log_path, "rb") as f:
+                    log_text = _strip_ansi(f.read().decode("utf-8", errors="replace"))
+            if os.path.isfile(metrics_path):
+                with open(metrics_path, "rb") as f:
+                    metrics_raw = f.read()
+            if os.path.isfile(services_path):
+                with open(services_path, "rb") as f:
+                    services_raw = f.read()
+            results.append(
+                ParsedTest(
+                    func=t.id,
+                    label=t.label,
+                    ok=bool(log_text.strip()),
+                    metrics=_parse_metrics_file(metrics_raw),
+                    services=_parse_services_file(services_raw),
+                    raw_log=log_text,
+                )
+            )
+        return results
+
+    def _cleanup_local_cache(self) -> None:
+        shutil.rmtree(self.local_cache_dir, ignore_errors=True)
 
     async def _download_and_parse(self) -> list[ParsedTest]:
         remote_tar = f"{REMOTE_TMP_PREFIX}{self.run_id}-result.tar.gz"
         base = os.path.basename(self.summary_dir)
-        await self.conn.run(f"tar -C /tmp -czf {remote_tar} {base}", check=False)
+        await self._run(f"tar -C /tmp -czf {remote_tar} {base}", timeout=SFTP_TIMEOUT)
 
         buf = io.BytesIO()
-        async with self.conn.start_sftp_client() as sftp:
-            async with sftp.open(remote_tar, "rb") as rf:
-                buf.write(await rf.read())
+        async with asyncio.timeout(SFTP_TIMEOUT):
+            async with self.conn.start_sftp_client() as sftp:
+                async with sftp.open(remote_tar, "rb") as rf:
+                    buf.write(await rf.read())
         buf.seek(0)
 
         results: list[ParsedTest] = []
@@ -757,7 +897,10 @@ class MultitestRun:
         if remote_tar:
             paths.append(remote_tar)
         quoted = " ".join(f"'{p}'" for p in paths)
-        await self.conn.run(f"rm -rf {quoted}", check=False)
+        try:
+            await self._run(f"rm -rf {quoted}")
+        except (OSError, asyncssh.Error, asyncio.TimeoutError):
+            pass  # best-effort — the target's own /tmp will clean itself up eventually regardless
 
     async def abandon(self) -> None:
         """Called when the user gives up on a connection-lost run instead of retrying — best
@@ -766,6 +909,7 @@ class MultitestRun:
         target is truly unreachable there's nothing more we can do from here, and the target's
         own /tmp will eventually clean itself up regardless."""
         self._cancelled = True
+        self._cleanup_local_cache()
         try:
             self.conn.close()
         except Exception:
@@ -776,10 +920,10 @@ class MultitestRun:
             return
         try:
             if self._launch_pid:
-                await self.conn.run(f"kill -KILL -{self._launch_pid} 2>/dev/null", check=False)
-            await self.conn.run(f"pkill -9 -f '{self.summary_dir}' 2>/dev/null", check=False)
+                await self._run(f"kill -KILL -{self._launch_pid} 2>/dev/null")
+            await self._run(f"pkill -9 -f '{self.summary_dir}' 2>/dev/null")
             await self._cleanup()
-        except (OSError, asyncssh.Error):
+        except (OSError, asyncssh.Error, asyncio.TimeoutError):
             pass
 
     async def run(
@@ -817,15 +961,15 @@ class MultitestRun:
         if self._last_running_idx is not None:
             try:
                 await self.skip_current()
-            except (OSError, asyncssh.Error):
+            except (OSError, asyncssh.Error, asyncio.TimeoutError):
                 pass
         try:
             if self._launch_pid:
-                await self.conn.run(f"kill -TERM -{self._launch_pid} 2>/dev/null", check=False)
+                await self._run(f"kill -TERM -{self._launch_pid} 2>/dev/null")
                 await asyncio.sleep(1)
-                await self.conn.run(f"kill -KILL -{self._launch_pid} 2>/dev/null", check=False)
-            await self.conn.run(f"pkill -9 -f '{self.summary_dir}' 2>/dev/null", check=False)
-        except (OSError, asyncssh.Error):
+                await self._run(f"kill -KILL -{self._launch_pid} 2>/dev/null")
+            await self._run(f"pkill -9 -f '{self.summary_dir}' 2>/dev/null")
+        except (OSError, asyncssh.Error, asyncio.TimeoutError):
             pass
         tests = await self._download_and_parse()
         return MultitestResult(tests=tests, cancelled=False, partial=True)
@@ -862,6 +1006,7 @@ class MultitestRun:
                 except asyncio.CancelledError:
                     pass
                 await self._cleanup()
+                self._cleanup_local_cache()
                 return MultitestResult(tests=[], cancelled=True)
 
             if winner == "finish_early" and not poll_task.done():
@@ -870,13 +1015,16 @@ class MultitestRun:
                     await poll_task
                 except asyncio.CancelledError:
                     pass
-                return await self._finish_early()
+                result = await self._finish_early()
+                self._cleanup_local_cache()
+                return result
 
             await poll_task  # poll_task itself finished first — re-await to surface any exception
         else:
             await poll_task
 
         tests = await self._download_and_parse()
+        self._cleanup_local_cache()
         return MultitestResult(tests=tests, cancelled=False)
 
 
