@@ -17,22 +17,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from aiogram.exceptions import TelegramBadRequest
-
 from bot.database import crud
 from bot.database.db import init_db
-
-
-async def _notify_waiters(bot) -> int:
-    waiters = await crud.pop_maintenance_waiters()
-    sent = 0
-    for uid in waiters:
-        try:
-            await bot.send_message(uid, "✅ Технические работы завершены — можно запускать проверку.")
-            sent += 1
-        except TelegramBadRequest:
-            pass
-    return sent
 
 
 async def main() -> None:
@@ -52,10 +38,11 @@ async def main() -> None:
 
     if action == "off":
         from bot.main import _build_bot
+        from bot.services import notify
 
         bot = _build_bot()
         try:
-            sent = await _notify_waiters(bot)
+            sent = await notify.notify_maintenance_ended(bot)
         finally:
             await bot.session.close()
         print(f"maintenance: off (notified {sent} waiting user(s))")

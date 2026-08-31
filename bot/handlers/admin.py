@@ -567,12 +567,7 @@ async def admin_maintenance_toggle(cb: CallbackQuery) -> None:
 
     if enabled:
         # Was on, now switching off — ping everyone who tried to start a test while it was on.
-        waiters = await crud.pop_maintenance_waiters()
-        for uid in waiters:
-            try:
-                await cb.bot.send_message(uid, "✅ Технические работы завершены — можно запускать проверку.")
-            except TelegramBadRequest:
-                pass
+        await notify.notify_maintenance_ended(cb.bot)
 
     await cb.message.edit_text(await _maintenance_text(), reply_markup=kb.admin_maintenance(not enabled))
     await cb.answer("Включено." if not enabled else "Выключено.")
@@ -668,6 +663,8 @@ async def admin_deluser_go(cb: CallbackQuery) -> None:
     archive.delete_user_dir(user_id)
     await cb.message.edit_text(f"🗑 Пользователь {user_id} и все его данные удалены.", reply_markup=kb.back_to_admin())
     await cb.answer("Удалено.")
+
+
 
 
 @router.callback_query(F.data.startswith("admin:report:"))

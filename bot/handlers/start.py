@@ -21,17 +21,22 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     is_new = await crud.upsert_user(message.from_user.id, message.from_user.username)
     is_admin = message.from_user.id == settings.admin_id
 
-    intro = test_info.build_menu_intro_text()
-    if await crud.is_maintenance_mode():
-        intro = f"{await crud.get_maintenance_message()}\n\n{intro}"
-
-    await message.answer(
-        intro,
-        reply_markup=kb.main_menu(is_admin),
-        parse_mode="Markdown",
-    )
     if is_new:
         uname = f"@{message.from_user.username}" if message.from_user.username else "без username"
         await notify.notify_text(
             message.bot, "registrations", f"👤 Новый пользователь: {uname} (id {message.from_user.id})"
         )
+
+    if await crud.is_maintenance_mode():
+        # Только сообщение о техработах — ни списка тестов, ни кнопки. Как только техработы
+        # закончатся, этому же пользователю придёт отдельное уведомление, а следом — обычный
+        # экран /start (см. crud.add_maintenance_waiter / notify_maintenance_waiters_off).
+        await crud.add_maintenance_waiter(message.from_user.id)
+        await message.answer(await crud.get_maintenance_message())
+        return
+
+    await message.answer(
+        test_info.build_menu_intro_text(),
+        reply_markup=kb.main_menu(is_admin),
+        parse_mode="Markdown",
+    )

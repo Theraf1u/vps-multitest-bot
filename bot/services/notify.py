@@ -120,6 +120,33 @@ async def notify_edit(bot: Bot, chat_id: int, message_id: int, text: str, **kwar
             log.debug("notify_edit failed: %s", e)
 
 
+async def notify_maintenance_ended(bot: Bot) -> int:
+    """Called right after maintenance mode is switched off — pops everyone who tried to start
+    a test while it was on and sends each of them two messages in sequence: a short "techworks
+    are over" notice, then the exact same screen a fresh /start would show (test list + main
+    menu button), so they don't have to type /start themselves to get going again. Returns how
+    many people were notified."""
+    from bot.config import settings
+    from bot import keyboards as kb
+    from bot.services import test_info
+
+    waiters = await crud.pop_maintenance_waiters()
+    sent = 0
+    for uid in waiters:
+        try:
+            await bot.send_message(uid, "✅ Технические работы завершены — можно запускать проверку.")
+            await bot.send_message(
+                uid,
+                test_info.build_menu_intro_text(),
+                reply_markup=kb.main_menu(uid == settings.admin_id),
+                parse_mode="Markdown",
+            )
+            sent += 1
+        except TelegramAPIError as e:
+            log.warning("notify_maintenance_ended: failed to message user %s: %s", uid, e)
+    return sent
+
+
 async def notify_document(bot: Bot, category: str, file_path: str, filename: str, caption: str | None = None) -> None:
     target = await _target(category)
     if not target:
