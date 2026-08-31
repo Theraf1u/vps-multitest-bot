@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import logging
 
+import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import FSInputFile, Message
+from aiohttp_socks import ProxyError as SocksProxyError
 
 from bot.database import crud
 
 log = logging.getLogger(__name__)
+
+# TelegramAPIError alone misses failures below aiogram's layer — a proxy hiccup (the bot talks
+# to Telegram through a SOCKS proxy) raises aiohttp_socks.ProxyError or a bare aiohttp.ClientError
+# instead, neither of which is a TelegramAPIError subclass. A notify_* call sitting in the middle
+# of a crash-recovery path (see test_flow._run_and_report's salvage handling) must not let one of
+# those propagate uncaught, or it aborts recovery before the run ever gets marked finished.
+_SEND_ERRORS = (TelegramAPIError, aiohttp.ClientError, SocksProxyError, OSError)
 
 # Categories the admin panel lets you point at a forum topic. One shared chat id,
 # each category optionally pinned to its own topic (message_thread_id) inside it.
@@ -79,7 +88,7 @@ async def auto_create_topics(bot: Bot) -> dict[str, str]:
             continue
         try:
             topic = await bot.create_forum_topic(int(chat_id), title)
-        except TelegramAPIError as e:
+        except _SEND_ERRORS as e:
             results[cat] = f"ошибка: {e}"
             log.warning("auto_create_topics(%s) failed: %s", cat, e)
             continue
@@ -95,7 +104,7 @@ async def notify_text(bot: Bot, category: str, text: str) -> None:
     chat_id, thread_id = target
     try:
         await bot.send_message(chat_id, text, message_thread_id=thread_id)
-    except TelegramAPIError as e:
+    except _SEND_ERRORS as e:
         log.warning("notify_text(%s) failed: %s", category, e)
 
 
@@ -108,7 +117,7 @@ async def notify_send(bot: Bot, category: str, text: str, **kwargs) -> Message |
     chat_id, thread_id = target
     try:
         return await bot.send_message(chat_id, text, message_thread_id=thread_id, **kwargs)
-    except TelegramAPIError as e:
+    except _SEND_ERRORS as e:
         log.warning("notify_send(%s) failed: %s", category, e)
         return None
 
@@ -116,7 +125,7 @@ async def notify_send(bot: Bot, category: str, text: str, **kwargs) -> Message |
 async def notify_edit(bot: Bot, chat_id: int, message_id: int, text: str, **kwargs) -> None:
     try:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, **kwargs)
-    except TelegramAPIError as e:
+    except _SEND_ERRORS as e:
         if "message is not modified" not in str(e):
             log.debug("notify_edit failed: %s", e)
 
@@ -143,7 +152,7 @@ async def notify_maintenance_ended(bot: Bot) -> int:
                 parse_mode="Markdown",
             )
             sent += 1
-        except TelegramAPIError as e:
+        except _SEND_ERRORS as e:
             log.warning("notify_maintenance_ended: failed to message user %s: %s", uid, e)
     return sent
 
@@ -160,5 +169,5 @@ async def notify_document(bot: Bot, category: str, file_path: str, filename: str
             caption=caption,
             message_thread_id=thread_id,
         )
-    except TelegramAPIError as e:
+    except _SEND_ERRORS as e:
         log.warning("notify_document(%s) failed: %s", category, e)

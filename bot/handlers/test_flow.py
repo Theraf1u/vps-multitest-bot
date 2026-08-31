@@ -7,10 +7,12 @@ import logging
 import os
 import time
 
+import aiohttp
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+from aiohttp_socks import ProxyError as SocksProxyError
 
 from bot import keyboards as kb
 from bot.config import settings
@@ -184,7 +186,14 @@ async def _safe_edit(message: Message, text: str, **kwargs) -> None:
             return
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
-        except TelegramAPIError as e:
+        # TelegramAPIError alone misses a proxy-level hiccup (the bot talks to Telegram through
+        # a SOCKS proxy) — that raises aiohttp_socks.ProxyError or a bare aiohttp.ClientError,
+        # neither a TelegramAPIError subclass. Left uncaught, one of those escapes _safe_edit
+        # entirely and can abort the crash-salvage path in _run_and_report before it ever
+        # reaches crud.finish_test_run — the run then sits "running" in the DB forever even
+        # though nothing is actually still working on it (this is exactly what happened to a
+        # real run once the proxy blipped mid-reconnect).
+        except (TelegramAPIError, aiohttp.ClientError, SocksProxyError, OSError) as e:
             if attempt == 3:
                 log.warning("edit_text gave up after %d attempts: %s", attempt + 1, e)
                 return
