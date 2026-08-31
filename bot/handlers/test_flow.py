@@ -129,22 +129,41 @@ def _progress_text(
     return "\n".join(lines)
 
 
-def _final_result_text(host: str, subset: list[mt.TestDef], result: mt.MultitestResult, skipped: set[int]) -> str:
+def _fmt_secs(secs: float | None) -> str:
+    if secs is None:
+        return ""
+    secs = round(secs)
+    if secs < 60:
+        return f"{secs}с"
+    minutes, s = divmod(secs, 60)
+    return f"{minutes}м {s}с" if s else f"{minutes}м"
+
+
+def _final_result_text(
+    host: str, subset: list[mt.TestDef], result: mt.MultitestResult, skipped: set[int], mt_run: "mt.MultitestRun | None" = None
+) -> str:
     """Итоговый список по каждому тесту (✅/⏭/⚠️/▫️) — заменяет собой голое "X/Y успешно" в
     финальных сообщениях, чтобы по одному сообщению в чате/админ-топике сразу было видно, какие
-    именно тесты прошли, какие пропущены, а какие упали, а не только агрегированную цифру."""
+    именно тесты прошли, какие пропущены, а какие упали, а не только агрегированную цифру. Каждая
+    строка также несёт своё время выполнения (когда оно известно), а в конце — общее время теста."""
     total = len(subset)
     lines = ["🧪 Проверка сервера — итог", f"Server: {host}", f"{'█' * 15} {result.ok_count}/{total}", ""]
+    durations = mt_run.test_durations() if mt_run is not None else [None] * total
     for i, t in enumerate(subset):
         parsed = result.tests[i] if i < len(result.tests) else None
+        time_note = f" ({_fmt_secs(durations[i])})" if durations[i] is not None else ""
         if i in skipped:
             lines.append(f"⏭ {t.label} — Пропущен")
         elif parsed is not None and parsed.ok:
-            lines.append(f"✅ {t.label}")
+            lines.append(f"✅ {t.label}{time_note}")
         elif parsed is not None and parsed.raw_log.strip():
-            lines.append(f"⚠️ {t.label} — ошибка")
+            lines.append(f"⚠️ {t.label} — ошибка{time_note}")
         else:
             lines.append(f"▫️ {t.label} — не выполнен")
+    total_secs = mt_run.total_duration() if mt_run is not None else None
+    if total_secs is not None:
+        lines.append("")
+        lines.append(f"⏱ Всего времени: {_fmt_secs(total_secs)}")
     return "\n".join(lines)
 
 
@@ -882,7 +901,7 @@ async def _run_and_report(
 
     server_label = f"{creds.host}:{creds.port}"
     done_note = "⏭ Отчёт по пройденным тестам\n\n" if result.partial else ""
-    detail_text = _final_result_text(creds.host, subset, result, run.skipped_indices)
+    detail_text = _final_result_text(creds.host, subset, result, run.skipped_indices, mt_run=run)
     forming_text = f"{done_note}{detail_text}\n\n📄 Формирую отчёт..."
     await _safe_edit(message, forming_text)
     await _mirror_admin(entry, message.bot, forming_text)

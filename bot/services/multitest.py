@@ -79,7 +79,13 @@ TEST_CATALOG: list[TestDef] = [
         "extra_instagram_audio", "Instagram Audio Block", 45, "shell",
         "bash <(curl -L -s https://bench.openode.xyz/checker_inst.sh)", dep="curl",
     ),
-    TestDef("extra_ipregion_xyz", "IP Region (ipregion.xyz)", 150, "shell", "bash <(wget -qO- https://ipregion.xyz)", dep="wget"),
+    TestDef(
+        "extra_ipregion_xyz", "IP Region (ipregion.xyz)", 150, "shell", "bash <(wget -qO- https://ipregion.xyz)",
+        # ipregion.xyz serves the same Davoyan/ipregion script as run_ip_region above — its own
+        # dependency check (jq/curl/util-linux) prompts on stdin if missing, hanging/failing
+        # headless. jq is the one actually missing in practice; wget is the base fetch dep.
+        dep="wget jq",
+    ),
     TestDef(
         "extra_region_restriction", "Region Restriction (Streaming)", 360, "shell",
         # -R 66 = "All Platforms" (the same value the script itself defaults to on a bare
@@ -361,6 +367,7 @@ class ParsedTest:
     metrics: list[tuple[str, str, str]] = dataclasses.field(default_factory=list)  # name, value, kind
     services: list[tuple[str, str, str, str]] = dataclasses.field(default_factory=list)  # type, name, status, value
     raw_log: str = ""
+    duration_secs: float | None = None  # wall-clock time this test took — see MultitestRun.test_durations
 
 
 @dataclasses.dataclass
@@ -518,7 +525,9 @@ def build_runner_script(
             )
         else:
             cmd_path = cmd_path_by_test_id[t.id]
-            dep_line = f'check_and_install {t.dep}\n' if t.dep else ""
+            # `dep` may be several space-separated commands (e.g. "wget jq") — each gets its
+            # own check_and_install call, same as the multi-dep vendor functions do inline.
+            dep_line = "".join(f"check_and_install {d}\n" for d in t.dep.split()) if t.dep else ""
             blocks.append(
                 f'log={log}\n'
                 f'{dep_line}'
@@ -571,6 +580,13 @@ class MultitestRun:
         # _cache_test_locally / load_cached_partial.
         self.local_cache_dir = os.path.join(settings.reports_dir, "_partial_cache", self.run_id)
         self._cached_indices: set[int] = set()  # 1-based test indices already saved to local_cache_dir
+
+        # Per-test wall-clock timing (0-based, same indexing as `subset`) — see test_durations()
+        # / total_duration() below. Kept on self (not local to _poll_progress) so a resume() after
+        # a reconnect doesn't lose timing already recorded for tests that finished before the drop.
+        self._test_started_at: list[float | None] = [None] * len(subset)
+        self._test_finished_at: list[float | None] = [None] * len(subset)
+        self._run_started_at: float | None = None
 
     async def _run(self, cmd: str, check: bool = False, timeout: float = CMD_TIMEOUT):
         """self.conn.run(...) bounded by a timeout — see the module-level comment above
@@ -662,8 +678,11 @@ class MultitestRun:
         # First wall-clock moment each test index was observed as "running", so we can
         # estimate a sub-progress percentage against its estimated_secs purely from polling —
         # neither the vendored script nor the standalone community scripts have a hook for
-        # reporting fractional progress themselves.
-        start_times: list[float | None] = [None] * total
+        # reporting fractional progress themselves. Also doubles as per-test duration tracking
+        # (self._test_started_at/_test_finished_at) for the final report — see test_durations().
+        start_times = self._test_started_at
+        if self._run_started_at is None:
+            self._run_started_at = time.monotonic()
         checks_since_any_progress = 0
         cached_up_to = 0
 
@@ -726,6 +745,8 @@ class MultitestRun:
             if completed > cached_up_to:
                 for finished_idx in range(cached_up_to + 1, completed + 1):
                     await self._cache_test_locally(finished_idx)
+                    if self._test_finished_at[finished_idx - 1] is None:
+                        self._test_finished_at[finished_idx - 1] = time.monotonic()
                 cached_up_to = completed
 
             if on_progress:
@@ -845,10 +866,40 @@ class MultitestRun:
                     raw_log=log_text,
                 )
             )
+        for pt, secs in zip(results, self.test_durations()):
+            pt.duration_secs = secs
         return results
 
     def _cleanup_local_cache(self) -> None:
         shutil.rmtree(self.local_cache_dir, ignore_errors=True)
+
+    def test_durations(self) -> list[float | None]:
+        """Best-effort wall-clock seconds each test in `subset` took, 0-based in subset order.
+        A test that finished between two polls without ever being observed as "running" (fast
+        test, slow poll_interval) has no recorded start — falls back to the previous test's
+        finish time (or the overall run start, for test 0) as its start instead of leaving a
+        gap. None only when we truly have no data for a slot (e.g. it never finished at all)."""
+        durations: list[float | None] = []
+        prev_end = self._run_started_at
+        for i in range(len(self.subset)):
+            start = self._test_started_at[i] if self._test_started_at[i] is not None else prev_end
+            end = self._test_finished_at[i]
+            if start is not None and end is not None:
+                durations.append(max(0.0, end - start))
+                prev_end = end
+            else:
+                durations.append(None)
+        return durations
+
+    def total_duration(self) -> float | None:
+        """Wall-clock seconds from launch to the last test finishing, or None if we never got
+        far enough to know either endpoint."""
+        if self._run_started_at is None:
+            return None
+        finish_times = [t for t in self._test_finished_at if t is not None]
+        if not finish_times:
+            return None
+        return max(finish_times) - self._run_started_at
 
     async def _download_and_parse(self) -> list[ParsedTest]:
         remote_tar = f"{REMOTE_TMP_PREFIX}{self.run_id}-result.tar.gz"
@@ -889,6 +940,8 @@ class MultitestRun:
                         raw_log=log_text,
                     )
                 )
+        for pt, secs in zip(results, self.test_durations()):
+            pt.duration_secs = secs
         await self._cleanup(remote_tar)
         return results
 

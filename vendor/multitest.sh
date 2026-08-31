@@ -195,8 +195,10 @@ check_and_install() {
 # Что нужно конкретному тесту. Пустая строка — тест ничего сверх базы не требует.
 test_deps() {
     case "$1" in
-        run_ip_region|run_censorcheck_geoblock|run_censorcheck_dpi|run_censorcheck_tlab|run_bench_sh)
+        run_censorcheck_tlab|run_bench_sh)
             echo "wget" ;;
+        run_ip_region|run_censorcheck_geoblock|run_censorcheck_dpi)
+            echo "wget jq" ;;
         run_iperf3_ru|run_iperf3_tlab)
             echo "wget iperf3 jq" ;;
         run_yabs|run_ip_check_place|run_ip_quality)
@@ -244,18 +246,25 @@ install_deps_for() {
 run_ip_region() {
     print_separator "IP Region"
     check_and_install wget
+    # ipregion.sh's own DEPENDENCIES=(jq curl util-linux) check prompts "Do you want to
+    # install them? [y/N]:" on stdin if any are missing — same class of hang/silent-fail as
+    # censorcheck.sh below, since we run headless. Pre-install so it never asks.
+    check_and_install jq
+    check_and_install column util-linux
     bash <(wget -qO- https://github.com/Davoyan/ipregion/raw/main/ipregion.sh)
 }
 
 run_censorcheck_geoblock() {
     print_separator "Censorcheck — проверка геоблока"
     check_and_install wget
+    check_and_install jq
     bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock
 }
 
 run_censorcheck_dpi() {
     print_separator "Censorcheck — DPI (серверы РФ)"
     check_and_install wget
+    check_and_install jq
     bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi
 }
 

@@ -13,6 +13,16 @@ def _icon_text(slot: str, emoji: str, text: str) -> str:
     return text if icons.get(slot) else f"{emoji} {text}"
 
 
+def _back_button(text: str, callback_data: str) -> InlineKeyboardButton:
+    """Every user-facing "go back" button shares one slot (nav_back) so the admin only has to
+    assign the premium arrow icon once and it's consistent everywhere, while each screen keeps
+    its own label ("Назад", "В меню", "К истории", ...)."""
+    return InlineKeyboardButton(
+        text=_icon_text("nav_back", "⬅️", text), callback_data=callback_data,
+        icon_custom_emoji_id=icons.get("nav_back"),
+    )
+
+
 def main_menu(is_admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
@@ -40,13 +50,16 @@ def cancel_flow() -> InlineKeyboardMarkup:
     """Used only on the host step and the fingerprint-confirm screen — the two points in the
     flow with no previous step to return to, so "back" really does mean "abandon"."""
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="test:cancel_flow")]]
+        inline_keyboard=[[_back_button("Назад", "test:cancel_flow")]]
     )
 
 
 def queue_wait() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🚫 Покинуть очередь", callback_data="test:queue_leave", style="danger")]]
+        inline_keyboard=[[InlineKeyboardButton(
+            text=_icon_text("queue_leave", "🚫", "Покинуть очередь"), callback_data="test:queue_leave", style="danger",
+            icon_custom_emoji_id=icons.get("queue_leave"),
+        )]]
     )
 
 
@@ -54,7 +67,7 @@ def port_step() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Стандартный 22", callback_data="test:port_default", style="primary")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="test:back:host")],
+            [_back_button("Назад", "test:back:host")],
         ]
     )
 
@@ -62,15 +75,18 @@ def port_step() -> InlineKeyboardMarkup:
 def login_step() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👤 root", callback_data="test:login_root", style="primary")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="test:back:port")],
+            [InlineKeyboardButton(
+                text=_icon_text("login_root", "👤", "root"), callback_data="test:login_root", style="primary",
+                icon_custom_emoji_id=icons.get("login_root"),
+            )],
+            [_back_button("Назад", "test:back:port")],
         ]
     )
 
 
 def password_step() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="test:back:login")]]
+        inline_keyboard=[[_back_button("Назад", "test:back:login")]]
     )
 
 
@@ -86,7 +102,7 @@ def confirm_start() -> InlineKeyboardMarkup:
                 text=_icon_text("confirm_pick", "🎯", "Выбрать тесты"), callback_data="test:pick", style="primary",
                 icon_custom_emoji_id=icons.get("confirm_pick"),
             )],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="test:back:password")],
+            [_back_button("Назад", "test:back:password")],
         ]
     )
 
@@ -94,9 +110,16 @@ def confirm_start() -> InlineKeyboardMarkup:
 def confirm_all_warning() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Всё равно запустить всё", callback_data="test:confirm_all_go", style="success")],
-            [InlineKeyboardButton(text="🎯 Выбрать тесты", callback_data="test:pick", style="primary")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="test:confirm_all_back")],
+            [InlineKeyboardButton(
+                text=_icon_text("confirm_all_anyway", "✅", "Всё равно запустить всё"),
+                callback_data="test:confirm_all_go", style="success",
+                icon_custom_emoji_id=icons.get("confirm_all_anyway"),
+            )],
+            [InlineKeyboardButton(
+                text=_icon_text("confirm_pick", "🎯", "Выбрать тесты"), callback_data="test:pick", style="primary",
+                icon_custom_emoji_id=icons.get("confirm_pick"),
+            )],
+            [_back_button("Назад", "test:confirm_all_back")],
         ]
     )
 
@@ -124,8 +147,14 @@ def test_picker(selected: set[str]) -> InlineKeyboardMarkup:
             rows.append(buttons[i : i + 2])
     rows.append(
         [
-            InlineKeyboardButton(text="✅ Все", callback_data="ts:all", style="success"),
-            InlineKeyboardButton(text="🚫 Ничего", callback_data="ts:none", style="danger"),
+            InlineKeyboardButton(
+                text=_icon_text("picker_select_all", "✅", "Все"), callback_data="ts:all", style="success",
+                icon_custom_emoji_id=icons.get("picker_select_all"),
+            ),
+            InlineKeyboardButton(
+                text=_icon_text("picker_select_none", "🚫", "Ничего"), callback_data="ts:none", style="danger",
+                icon_custom_emoji_id=icons.get("picker_select_none"),
+            ),
         ]
     )
     n = len(selected)
@@ -133,15 +162,19 @@ def test_picker(selected: set[str]) -> InlineKeyboardMarkup:
         text=_icon_text("picker_go", "▶️", f"Начать ({n})"), callback_data="ts:go", style="primary",
         icon_custom_emoji_id=icons.get("picker_go"),
     )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="test:back:confirm")])
+    rows.append([_back_button("Назад", "test:back:confirm")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def confirm_fingerprint() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить сервер", callback_data="test:confirm_fp", style="success")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="test:cancel_flow")],
+            [InlineKeyboardButton(
+                text=_icon_text("confirm_fingerprint_ok", "✅", "Подтвердить сервер"),
+                callback_data="test:confirm_fp", style="success",
+                icon_custom_emoji_id=icons.get("confirm_fingerprint_ok"),
+            )],
+            [_back_button("Назад", "test:cancel_flow")],
         ]
     )
 
@@ -149,8 +182,16 @@ def confirm_fingerprint() -> InlineKeyboardMarkup:
 def reconnect_offer() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Попробовать ещё раз", callback_data="test:reconnect", style="primary")],
-            [InlineKeyboardButton(text="🛑 Отменить", callback_data="test:reconnect_cancel", style="danger")],
+            [InlineKeyboardButton(
+                text=_icon_text("reconnect_retry", "🔄", "Попробовать ещё раз"),
+                callback_data="test:reconnect", style="primary",
+                icon_custom_emoji_id=icons.get("reconnect_retry"),
+            )],
+            [InlineKeyboardButton(
+                text=_icon_text("reconnect_cancel", "🛑", "Отменить"),
+                callback_data="test:reconnect_cancel", style="danger",
+                icon_custom_emoji_id=icons.get("reconnect_cancel"),
+            )],
         ]
     )
 
@@ -176,7 +217,10 @@ def rating_request(run_id: int) -> InlineKeyboardMarkup:
 
 def rating_thanks(rating_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="💬 Оставить комментарий", callback_data=f"rate:comment:{rating_id}")]]
+        inline_keyboard=[[InlineKeyboardButton(
+            text=_icon_text("rating_comment", "💬", "Оставить комментарий"), callback_data=f"rate:comment:{rating_id}",
+            icon_custom_emoji_id=icons.get("rating_comment"),
+        )]]
     )
 
 
@@ -208,7 +252,7 @@ def back_to_openrouter() -> InlineKeyboardMarkup:
 
 
 def back_to_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[_back_button("В меню", "menu:main")]])
 
 
 def admin_menu() -> InlineKeyboardMarkup:
@@ -343,7 +387,7 @@ def history_list(runs: list, page: int, has_more: bool) -> InlineKeyboardMarkup:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"hist:list:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")])
+    rows.append([_back_button("В меню", "menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -360,18 +404,21 @@ def history_item(run_id: int, status: str, has_pdf: bool, ai_available: bool = F
             icon_custom_emoji_id=icons.get("history_ai"),
         )])
     if status == "running":
-        rows.append([InlineKeyboardButton(text="🛑 Остановить тест", callback_data=f"hist:cancel:{run_id}", style="danger")])
+        rows.append([InlineKeyboardButton(
+            text=_icon_text("history_stop", "🛑", "Остановить тест"), callback_data=f"hist:cancel:{run_id}", style="danger",
+            icon_custom_emoji_id=icons.get("history_stop"),
+        )])
     else:
         rows.append([InlineKeyboardButton(
             text=_icon_text("history_retry", "🔄", "Повторить"), callback_data=f"hist:retry:{run_id}", style="success",
             icon_custom_emoji_id=icons.get("history_retry"),
         )])
-    rows.append([InlineKeyboardButton(text="⬅️ К истории", callback_data="hist:list:0")])
+    rows.append([_back_button("К истории", "hist:list:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_to_history_item(run_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К тесту", callback_data=f"hist:item:{run_id}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[_back_button("К тесту", f"hist:item:{run_id}")]])
 
 
 def admin_users_list(user_ids: list[int], page: int, has_more: bool) -> InlineKeyboardMarkup:
