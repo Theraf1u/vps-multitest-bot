@@ -8,7 +8,7 @@ import os
 import time
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
@@ -130,21 +130,29 @@ def _progress_text(
 
 
 async def _safe_edit(message: Message, text: str, **kwargs) -> None:
-    try:
-        await message.edit_text(text, **kwargs)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e):
-            log.warning("edit_text failed: %s", e)
-    except TelegramRetryAfter as e:
-        # Telegram's own flood control (global ~30 msg/s across the whole bot) — under high
-        # concurrency (many progress bars editing at once) this fires well before the bot's
-        # own resources are the bottleneck. One retry after the mandated wait is enough for a
-        # progress-bar tick; if it fails again the next poll cycle will just show it a bit late.
-        await asyncio.sleep(e.retry_after)
+    """Never lets a Telegram-side hiccup take down the caller — the actual multitest run keeps
+    going on the target VPS via setsid nohup regardless of whether we can currently paint a
+    progress bar. Retries a transient failure (flood control, a Bad-Gateway-style blip) a few
+    times with backoff before giving up, since giving up on a *terminal* status message (run
+    finished/failed) means it never gets corrected — there's no "next poll" to retry it for."""
+    delay = 3.0
+    for attempt in range(4):
         try:
             await message.edit_text(text, **kwargs)
-        except (TelegramBadRequest, TelegramRetryAfter) as e2:
-            log.warning("edit_text retry failed: %s", e2)
+            return
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                log.warning("edit_text failed: %s", e)
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramAPIError as e:
+            if attempt == 3:
+                log.warning("edit_text gave up after %d attempts: %s", attempt + 1, e)
+                return
+            log.warning("edit_text failed (Telegram-side, attempt %d/4): %s", attempt + 1, e)
+            await asyncio.sleep(delay)
+            delay *= 2
 
 
 async def _mirror_admin(entry: dict, bot, text: str) -> None:
@@ -732,12 +740,32 @@ async def _run_and_report(
     except Exception as e:
         log.exception("multitest run failed")
         err_text = security.redact(str(e))
-        await crud.finish_test_run(run_id, "error", 0, 0, error=err_text)
+
+        # A crash mid-run (Telegram-side outage, a bug, whatever) shouldn't throw away tests
+        # that already finished — the remote data survives independently of what killed us
+        # here, so try to salvage it into a partial report before giving up outright, the same
+        # way "📊 Отчёт по готовым" does for a user-requested early stop.
+        salvaged: list[mt.ParsedTest] = []
+        try:
+            salvaged = await run._download_and_parse()
+        except Exception:
+            log.exception("salvage download after crash also failed")
+
+        if not any(t.raw_log.strip() for t in salvaged):
+            await crud.finish_test_run(run_id, "error", 0, 0, error=err_text)
+            await notify.notify_text(
+                message.bot, "errors", f"⚠️ Ошибка теста {creds.host}:{creds.port} (user {user_id}):\n{err_text}"
+            )
+            await _fail(message, state, user_id, f"❌ Ошибка при выполнении тестов\n{err_text}")
+            return
+
+        result = mt.MultitestResult(tests=salvaged, cancelled=False, partial=True)
         await notify.notify_text(
-            message.bot, "errors", f"⚠️ Ошибка теста {creds.host}:{creds.port} (user {user_id}):\n{err_text}"
+            message.bot, "errors",
+            f"⚠️ Тест {creds.host}:{creds.port} (user {user_id}) прервался ({err_text}), но "
+            f"{result.ok_count}/{len(subset)} тестов успели пройти — собираю отчёт по ним.",
         )
-        await _fail(message, state, user_id, f"❌ Ошибка при выполнении тестов\n{err_text}")
-        return
+        # falls through to the normal report-building path below with the salvaged result
 
     if result.cancelled:
         await crud.finish_test_run(run_id, "cancelled", 0, 0)
